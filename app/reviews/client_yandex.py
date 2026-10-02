@@ -3,6 +3,7 @@ import http.cookiejar
 import json
 import logging
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,18 +54,93 @@ class YandexReviewsClient:
         self._session_id: str | None = None
         self._locale: str = "ru_RU"
         self._base_origin: str = "https://yandex.ru"
-        self._last_rating: float | None = None
-        self._last_count: int | None = None
+        self._branch_ratings: dict[str, float] = {}
+        self._branch_counts: dict[str, int] = {}
+        self._ratings_updated_at: dict[str, float] = {}
+
+    @property
+    def _last_rating(self) -> float | None:
+        return next(iter(self._branch_ratings.values()), None)
+
+    @property
+    def _last_count(self) -> int | None:
+        return next(iter(self._branch_counts.values()), None)
 
     async def close(self) -> None:
         pass
 
     def _create_opener(self) -> urllib.request.OpenerDirector:
-        self._cookie_jar = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self._cookie_jar)
-        )
+        if self._opener is None:
+            self._cookie_jar = http.cookiejar.CookieJar()
+            self._opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self._cookie_jar)
+            )
         return self._opener
+
+    def _parse_page_metadata(self, html: str) -> tuple[float | None, int | None]:
+        scripts = re.findall(
+            r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL,
+        )
+        if not scripts:
+            return None, None
+        try:
+            page_data = json.loads(scripts[0])
+            stack = page_data.get("stack", [])
+            if isinstance(stack, list) and len(stack) > 0 and isinstance(stack[0], dict):
+                results = stack[0].get("results", {}) if isinstance(stack[0], dict) else {}
+                items = results.get("items", []) if isinstance(results, dict) else []
+                if isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict):
+                    rating_data = items[0].get("ratingData", {})
+                    if isinstance(rating_data, dict):
+                        rating = None
+                        count = None
+                        val = rating_data.get("ratingValue")
+                        if val is not None:
+                            try:
+                                rating = round(float(val), 1)
+                            except (ValueError, TypeError):
+                                pass
+                        cnt = rating_data.get("reviewCount")
+                        if cnt is not None:
+                            try:
+                                count = int(cnt)
+                            except (ValueError, TypeError):
+                                pass
+                        return rating, count
+        except Exception:
+            pass
+        return None, None
+
+    def _fetch_branch_rating(self, source: ReviewSource) -> float | None:
+        try:
+            opener = self._create_opener()
+            page_req = urllib.request.Request(
+                source.url,
+                headers={
+                    "User-Agent": self._user_agent,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+            )
+            with opener.open(page_req, timeout=self._timeout) as resp:
+                final_url = resp.geturl()
+                html = resp.read().decode("utf-8", errors="replace")
+
+            if "showcaptcha" in final_url or "showcaptcha" in html.lower():
+                return None
+
+            rating, count = self._parse_page_metadata(html)
+            self._ratings_updated_at[source.external_id] = time.time()
+            if rating is not None:
+                self._branch_ratings[source.external_id] = rating
+            if count is not None:
+                self._branch_counts[source.external_id] = count
+            return rating
+        except Exception as exc:
+            logger.debug("Failed to fetch branch rating for %s: %s", source.branch_name, exc)
+            return None
 
     def _initialize_session(
         self,
@@ -116,26 +192,12 @@ class YandexReviewsClient:
             self._session_id = analytics.get("sessionId")
             self._locale = cfg.get("locale", "ru_RU") if isinstance(cfg, dict) else "ru_RU"
 
-            # Extract branch rating and review count from page_data stack
-            stack = page_data.get("stack", [])
-            if isinstance(stack, list) and len(stack) > 0 and isinstance(stack[0], dict):
-                results = stack[0].get("results", {}) if isinstance(stack[0], dict) else {}
-                items = results.get("items", []) if isinstance(results, dict) else []
-                if isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict):
-                    rating_data = items[0].get("ratingData", {})
-                    if isinstance(rating_data, dict):
-                        val = rating_data.get("ratingValue")
-                        if val is not None:
-                            try:
-                                self._last_rating = round(float(val), 1)
-                            except (ValueError, TypeError):
-                                pass
-                        cnt = rating_data.get("reviewCount")
-                        if cnt is not None:
-                            try:
-                                self._last_count = int(cnt)
-                            except (ValueError, TypeError):
-                                pass
+            rating, count = self._parse_page_metadata(html)
+            self._ratings_updated_at[source.external_id] = time.time()
+            if rating is not None:
+                self._branch_ratings[source.external_id] = rating
+            if count is not None:
+                self._branch_counts[source.external_id] = count
 
             if not self._csrf_token or not self._session_id:
                 return ReviewSyncStatus.PARSER_FORMAT_CHANGED, "Missing csrfToken or sessionId", 200
@@ -163,7 +225,14 @@ class YandexReviewsClient:
         if not self._csrf_token or not self._session_id or self._opener is None:
             init_status, err, http_code = self._initialize_session(source)
             if init_status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
-                return init_status, [], err, http_code, self._last_rating, self._last_count
+                return (
+                    init_status,
+                    [],
+                    err,
+                    http_code,
+                    self._branch_ratings.get(source.external_id),
+                    self._branch_counts.get(source.external_id),
+                )
 
         # Step 2: Call fetchReviews endpoint (max 1 retry after real session refresh)
         for attempt in range(2):
@@ -208,18 +277,21 @@ class YandexReviewsClient:
                             [],
                             "Invalid response schema: expected data.reviews list",
                             200,
-                            self._last_rating,
-                            self._last_count,
+                            self._branch_ratings.get(source.external_id),
+                            self._branch_counts.get(source.external_id),
                         )
                     reviews_data = data["data"]["reviews"]
                     params_dict = data["data"].get("params", {})
-                    if self._last_count is None and isinstance(params_dict, dict):
-                        total_p = params_dict.get("count")
-                        if total_p is not None:
-                            try:
-                                self._last_count = int(total_p)
-                            except (ValueError, TypeError):
-                                pass
+                    if isinstance(params_dict, dict) and "count" in params_dict:
+                        try:
+                            self._branch_counts[source.external_id] = int(params_dict["count"])
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Ensure we have branch rating for this specific source
+                    now_ts = time.time()
+                    if (now_ts - self._ratings_updated_at.get(source.external_id, 0)) > 600:
+                        self._fetch_branch_rating(source)
 
                     items: list[ReviewItem] = []
                     for r in reviews_data:
@@ -229,8 +301,8 @@ class YandexReviewsClient:
                                 [],
                                 "Invalid review item structure: expected dict",
                                 200,
-                                self._last_rating,
-                                self._last_count,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
                             )
                         rev_id = str(r.get("reviewId", "")).strip()
                         if not rev_id:
@@ -239,8 +311,8 @@ class YandexReviewsClient:
                                 [],
                                 "Missing reviewId in Yandex review item",
                                 200,
-                                self._last_rating,
-                                self._last_count,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
                             )
 
                         # Strict rating validation: Never invent rating=5
@@ -251,8 +323,8 @@ class YandexReviewsClient:
                                 [],
                                 f"Missing rating in Yandex review item {rev_id}",
                                 200,
-                                self._last_rating,
-                                self._last_count,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
                             )
                         try:
                             rating = int(raw_rating)
@@ -265,8 +337,8 @@ class YandexReviewsClient:
                                     f"for Yandex review {rev_id}"
                                 ),
                                 200,
-                                self._last_rating,
-                                self._last_count,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
                             )
                         if not (1 <= rating <= 5):
                             return (
@@ -274,8 +346,8 @@ class YandexReviewsClient:
                                 [],
                                 f"Rating {rating} out of range [1, 5] for Yandex review {rev_id}",
                                 200,
-                                self._last_rating,
-                                self._last_count,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
                             )
 
                         # Strict updatedTime validation
@@ -286,8 +358,8 @@ class YandexReviewsClient:
                                 [],
                                 f"Missing updatedTime for Yandex review {rev_id}",
                                 200,
-                                self._last_rating,
-                                self._last_count,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
                             )
                         published_at = str(raw_updated).strip()
 
@@ -316,7 +388,14 @@ class YandexReviewsClient:
                             )
                         )
 
-                    return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, items, None, 200, self._last_rating, self._last_count
+                    return (
+                        ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS,
+                        items,
+                        None,
+                        200,
+                        self._branch_ratings.get(source.external_id),
+                        self._branch_counts.get(source.external_id),
+                    )
 
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403) and attempt == 0:
@@ -328,21 +407,77 @@ class YandexReviewsClient:
                     self._session_id = None
                     init_status, err, http_code = self._initialize_session(source)
                     if init_status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
-                        return init_status, [], f"Session refresh failed: {err}", http_code, self._last_rating, self._last_count
+                        return (
+                            init_status,
+                            [],
+                            f"Session refresh failed: {err}",
+                            http_code,
+                            self._branch_ratings.get(source.external_id),
+                            self._branch_counts.get(source.external_id),
+                        )
                     continue
                 if exc.code == 429:
-                    return ReviewSyncStatus.RATE_LIMITED, [], "Rate limited (HTTP 429)", 429, self._last_rating, self._last_count
+                    return (
+                        ReviewSyncStatus.RATE_LIMITED,
+                        [],
+                        "Rate limited (HTTP 429)",
+                        429,
+                        self._branch_ratings.get(source.external_id),
+                        self._branch_counts.get(source.external_id),
+                    )
                 if exc.code == 403:
-                    return ReviewSyncStatus.SOURCE_BLOCKED, [], "Forbidden (HTTP 403)", 403, self._last_rating, self._last_count
-                return ReviewSyncStatus.HTTP_ERROR, [], f"HTTP {exc.code}", exc.code, self._last_rating, self._last_count
+                    return (
+                        ReviewSyncStatus.SOURCE_BLOCKED,
+                        [],
+                        "Forbidden (HTTP 403)",
+                        403,
+                        self._branch_ratings.get(source.external_id),
+                        self._branch_counts.get(source.external_id),
+                    )
+                return (
+                    ReviewSyncStatus.HTTP_ERROR,
+                    [],
+                    f"HTTP {exc.code}",
+                    exc.code,
+                    self._branch_ratings.get(source.external_id),
+                    self._branch_counts.get(source.external_id),
+                )
             except urllib.error.URLError as exc:
-                return ReviewSyncStatus.NETWORK_ERROR, [], f"Network error: {exc.reason}", None, self._last_rating, self._last_count
+                return (
+                    ReviewSyncStatus.NETWORK_ERROR,
+                    [],
+                    f"Network error: {exc.reason}",
+                    None,
+                    self._branch_ratings.get(source.external_id),
+                    self._branch_counts.get(source.external_id),
+                )
             except json.JSONDecodeError as exc:
-                return ReviewSyncStatus.PARSER_FORMAT_CHANGED, [], f"JSON parse error: {exc}", 200, self._last_rating, self._last_count
+                return (
+                    ReviewSyncStatus.PARSER_FORMAT_CHANGED,
+                    [],
+                    f"JSON parse error: {exc}",
+                    200,
+                    self._branch_ratings.get(source.external_id),
+                    self._branch_counts.get(source.external_id),
+                )
             except Exception as exc:
-                return ReviewSyncStatus.UNKNOWN_ERROR, [], f"Unexpected error: {exc}", None, self._last_rating, self._last_count
+                return (
+                    ReviewSyncStatus.UNKNOWN_ERROR,
+                    [],
+                    f"Unexpected error: {exc}",
+                    None,
+                    self._branch_ratings.get(source.external_id),
+                    self._branch_counts.get(source.external_id),
+                )
 
-        return ReviewSyncStatus.SOURCE_BLOCKED, [], "Failed after session refresh", 403, self._last_rating, self._last_count
+        return (
+            ReviewSyncStatus.SOURCE_BLOCKED,
+            [],
+            "Failed after session refresh",
+            403,
+            self._branch_ratings.get(source.external_id),
+            self._branch_counts.get(source.external_id),
+        )
 
     async def fetch_reviews(
         self,
