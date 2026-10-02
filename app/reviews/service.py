@@ -199,11 +199,12 @@ class ReviewsService:
         # Call platform client
         if source.platform == ReviewPlatform.YANDEX:
             client = self._get_yandex_client()
-            status, items, err, http_code = await client.fetch_reviews(
+            res = await client.fetch_reviews(
                 source, page=1, page_size=config.fetch_page_size
             )
-            branch_rating = None
-            total_count = None
+            status, items, err, http_code = res[:4]
+            branch_rating = res[4] if len(res) >= 5 else getattr(client, "_last_rating", None)
+            total_count = res[5] if len(res) >= 6 else getattr(client, "_last_count", None)
         elif source.platform == ReviewPlatform.DGIS:
             d_client = self._get_dgis_client()
             (
@@ -263,11 +264,15 @@ class ReviewsService:
                         await asyncio.sleep(config.request_pause_seconds)
 
                     if source.platform == ReviewPlatform.YANDEX:
-                        b_status, b_items, b_err, b_http_code = (
-                            await self._get_yandex_client().fetch_reviews(
-                                source, page=current_page, page_size=config.fetch_page_size
-                            )
+                        y_res = await self._get_yandex_client().fetch_reviews(
+                            source, page=current_page, page_size=config.fetch_page_size
                         )
+                        b_status, b_items, b_err, b_http_code = y_res[:4]
+                        if len(y_res) >= 6:
+                            if y_res[4] is not None:
+                                branch_rating = y_res[4]
+                            if y_res[5] is not None:
+                                total_count = y_res[5]
                     else:
                         (
                             b_status,
@@ -370,11 +375,15 @@ class ReviewsService:
                     await asyncio.sleep(config.request_pause_seconds)
 
                 if source.platform == ReviewPlatform.YANDEX:
-                    c_status, c_items, c_err, c_http_code = (
-                        await self._get_yandex_client().fetch_reviews(
-                            source, page=current_page, page_size=config.fetch_page_size
-                        )
+                    y_res = await self._get_yandex_client().fetch_reviews(
+                        source, page=current_page, page_size=config.fetch_page_size
                     )
+                    c_status, c_items, c_err, c_http_code = y_res[:4]
+                    if len(y_res) >= 6:
+                        if y_res[4] is not None:
+                            branch_rating = y_res[4]
+                        if y_res[5] is not None:
+                            total_count = y_res[5]
                 else:
                     (
                         c_status,
@@ -451,6 +460,32 @@ class ReviewsService:
             )
         else:
             status = ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+
+        # Check for rating change alert
+        if (
+            source.is_initialized
+            and source.last_rating is not None
+            and branch_rating is not None
+            and round(float(source.last_rating), 1) != round(float(branch_rating), 1)
+            and config.alerts_enabled
+            and self.alerts
+        ):
+            try:
+                logger.info(
+                    "Rating changed for %s (%s): %s -> %s",
+                    source.branch_name,
+                    source.platform,
+                    source.last_rating,
+                    branch_rating,
+                )
+                await self.alerts.send_rating_change_alert(
+                    source=source,
+                    old_rating=round(float(source.last_rating), 1),
+                    new_rating=round(float(branch_rating), 1),
+                    total_count=total_count,
+                )
+            except Exception as rating_exc:
+                logger.error("Failed to send rating change alert: %s", rating_exc)
 
         await self.repository.update_source_status(
             source.id,

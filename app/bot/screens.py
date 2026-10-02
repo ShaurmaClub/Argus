@@ -177,9 +177,14 @@ def reviews_sources_text(sources: list) -> str:
         branch = getattr(s, "branch_name", "Филиал")
         raw_chk = getattr(s, "last_checked_at", None)
         last_chk = format_msk_datetime(raw_chk) if raw_chk else "не проверялся"
-        rating_str = (
-            f" ⭐ {s.last_rating:.1f}" if getattr(s, "last_rating", None) is not None else ""
-        )
+        rating_str = ""
+        if getattr(s, "last_rating", None) is not None:
+            count_part = (
+                f" ({s.total_reviews_count})"
+                if getattr(s, "total_reviews_count", None) is not None
+                else ""
+            )
+            rating_str = f" ⭐ {s.last_rating:.1f}{count_part}"
 
         lines.append(f"{status_icon} <b>{escape(branch)}</b> ({platform_name}){rating_str}")
         lines.append(f"   Проверка: <code>{escape(last_chk)}</code>")

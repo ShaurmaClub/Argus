@@ -724,3 +724,44 @@ class AlertService:
                     "Failed to send scheduler recovery alert to chat %s: %s", chat_id, exc
                 )
         return delivered_any
+
+    async def send_rating_change_alert(
+        self,
+        source: Any,
+        old_rating: float,
+        new_rating: float,
+        total_count: int | None = None,
+    ) -> bool:
+        if not await self._reviews_alert_enabled():
+            return False
+        plat = getattr(source, "platform", "")
+        plat_val = plat.value if hasattr(plat, "value") else str(plat)
+        platform_name = "Яндекс.Карты" if plat_val == "yandex" else "2ГИС"
+        diff = round(new_rating - old_rating, 2)
+        diff_str = f"+{diff:.1f}" if diff > 0 else f"{diff:.1f}"
+        icon = "📈" if diff > 0 else "📉"
+        branch_name = getattr(source, "branch_name", "")
+        lines = [
+            f"{icon} <b>Изменение рейтинга ({escape(platform_name)})</b>\n",
+            f"<b>Отделение:</b> {escape(branch_name)}",
+            f"<b>Рейтинг:</b> {old_rating:.1f} ➔ <b>{new_rating:.1f}</b> ({diff_str} ⭐)",
+        ]
+        if total_count is not None:
+            lines.append(f"<b>Всего отзывов:</b> {total_count}")
+        url = getattr(source, "url", None)
+        if url:
+            lines.append(f'\n<a href="{escape(url)}">Открыть страницу отделения</a>')
+        msg = "\n".join(lines)
+        targets = self._alert_targets()
+        delivered_any = False
+        for chat_id in targets:
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    disable_web_page_preview=True,
+                )
+                delivered_any = True
+            except Exception as exc:
+                logger.warning("Failed to send rating change alert to chat %s: %s", chat_id, exc)
+        return delivered_any

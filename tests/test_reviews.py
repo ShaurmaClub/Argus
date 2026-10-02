@@ -117,6 +117,7 @@ async def test_env(tmp_path: Path):
     bundle = RepositoryBundle(database)
     settings = Settings(
         bot_token="123456:dummy_test_token",
+        alert_chat_id=None,
         admin_ids_text="99999",
         enable_reviews_monitor=True,
         reviews_poll_interval_seconds=900,
@@ -965,7 +966,7 @@ async def test_parser_changed_http_200_invalid_schema(test_env):
         mock_opener.open.return_value = mock_resp_yandex
         client_yandex._opener = mock_opener
 
-        status, items, err, code = await client_yandex.fetch_reviews(yandex_source)
+        status, items, err, code, *_ = await client_yandex.fetch_reviews(yandex_source)
         assert status == ReviewSyncStatus.PARSER_FORMAT_CHANGED, f"Failed for {broken_json}"
         assert status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
         assert code == 200
@@ -1217,7 +1218,7 @@ async def test_yandex_403_refreshes_session_before_retry():
         mock_create_opener.return_value = mock_opener
         client._opener = mock_opener
 
-        status, items, err, code = await client.fetch_reviews(source)
+        status, items, err, code, *_ = await client.fetch_reviews(source)
 
         assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
         assert len(items) == 1
@@ -1262,7 +1263,7 @@ async def test_yandex_403_stops_after_max_one_retry():
         mock_create_opener.return_value = mock_opener
         client._opener = mock_opener
 
-        status, items, err, code = await client.fetch_reviews(source)
+        status, items, err, code, *_ = await client.fetch_reviews(source)
 
         assert status == ReviewSyncStatus.SOURCE_BLOCKED
         assert code == 403
@@ -1405,7 +1406,7 @@ async def test_yandex_missing_and_invalid_rating_never_becomes_five_stars():
         mock_opener.open.return_value = mock_resp
         client._opener = mock_opener
 
-        status, items, err, code = await client.fetch_reviews(source)
+        status, items, err, code, *_ = await client.fetch_reviews(source)
         assert status == ReviewSyncStatus.PARSER_FORMAT_CHANGED
         assert len(items) == 0
         assert "rating" in (err or "").lower()
@@ -1762,6 +1763,7 @@ async def test_multi_target_partial_failure_idempotent_retry(tmp_path: Path):
     bundle = RepositoryBundle(database)
     settings = Settings(
         bot_token="123456:dummy_test_token",
+        alert_chat_id=None,
         admin_ids_text="111,222",
         enable_reviews_monitor=True,
         alerts_reviews_enabled=True,
@@ -2474,4 +2476,145 @@ async def test_scheduler_timeout_error_compatibility(test_env):
     # It must not increment _consecutive_loop_crashes
     await scheduler._poll_cycle(wait_after=False)
     assert scheduler.consecutive_crashes == 0
+
+
+# ==============================================================================
+# 43. Yandex client rating and count extraction
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_yandex_client_extracts_rating_and_count():
+    client = YandexReviewsClient()
+    source = ReviewSource(
+        id=1,
+        platform=ReviewPlatform.YANDEX,
+        branch_name="УО Датахаб",
+        external_id="1093602317",
+        url="https://yandex.ru/maps/org/datakhab/1093602317/reviews/",
+    )
+
+    page_html = (
+        '<html><body><script type="application/json">'
+        + json.dumps(
+            {
+                "config": {
+                    "csrfToken": "test_token",
+                    "counters": {"analytics": {"sessionId": "test_session"}},
+                    "locale": "ru_RU",
+                },
+                "stack": [
+                    {
+                        "results": {
+                            "items": [
+                                {
+                                    "ratingData": {
+                                        "ratingValue": 4.80000019,
+                                        "reviewCount": 293,
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+        + "</script></body></html>"
+    )
+
+    fetch_json = {
+        "data": {
+            "reviews": [],
+            "params": {"count": 293, "page": 1},
+        }
+    }
+
+    mock_resp_page = MagicMock()
+    mock_resp_page.geturl.return_value = source.url
+    mock_resp_page.read.return_value = page_html.encode("utf-8")
+    mock_resp_page.__enter__.return_value = mock_resp_page
+    mock_resp_page.__exit__.return_value = False
+
+    mock_resp_fetch = MagicMock()
+    mock_resp_fetch.read.return_value = json.dumps(fetch_json).encode("utf-8")
+    mock_resp_fetch.__enter__.return_value = mock_resp_fetch
+    mock_resp_fetch.__exit__.return_value = False
+
+    with patch.object(client, "_create_opener") as mock_opener_factory:
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = [mock_resp_page, mock_resp_fetch]
+        mock_opener_factory.return_value = mock_opener
+        client._opener = mock_opener
+
+        status, items, err, code, rating, total = await client.fetch_reviews(source)
+        assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+        assert rating == 4.8
+        assert total == 293
+
+
+# ==============================================================================
+# 44. Rating change triggers alert in ReviewsService
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_rating_change_triggers_alert(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    bot = test_env["bot"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+
+    # 1. First sync sets initial rating without alert
+    await bundle.reviews.mark_source_initialized(source.id)
+    await bundle.reviews.update_source_status(
+        source.id,
+        status="SUCCESS_NO_NEW_REVIEWS",
+        checked_at=datetime.now(UTC).isoformat(),
+        success=True,
+        last_rating=4.8,
+        total_reviews_count=290,
+    )
+    s_updated = await bundle.reviews.get_source_by_id(source.id)
+    assert s_updated.last_rating == 4.8
+
+    # 2. Rating changes to 4.9 on next cycle
+    test_env["yandex_client"].reviews_to_return = []
+    # Mock fetch_reviews to return new rating
+    async def mock_fetch_new_rating(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 4.9, 295
+
+    test_env["yandex_client"].fetch_reviews = mock_fetch_new_rating
+
+    bot.sent_messages.clear()
+    await service.sync_source(s_updated)
+
+    # Must send rating change alert to telegram
+    assert len(bot.sent_messages) == 1
+    msg_text = bot.sent_messages[0]["text"]
+    assert "📈 <b>Изменение рейтинга (Яндекс.Карты)</b>" in msg_text
+    assert "УО Датахаб" in msg_text
+    assert "4.8 ➔ <b>4.9</b> (+0.1 ⭐)" in msg_text
+    assert "<b>Всего отзывов:</b> 295" in msg_text
+
+
+# ==============================================================================
+# 45. Screen reviews_sources_text displays rating and review count
+# ==============================================================================
+def test_screens_reviews_sources_text_with_rating_and_count():
+    from app.bot.screens import reviews_sources_text
+    from app.reviews.models import ReviewSource
+
+    s = ReviewSource(
+        id=1,
+        branch_name="УО Датахаб",
+        platform=ReviewPlatform.YANDEX,
+        external_id="1093602317",
+        url="https://yandex.ru",
+        last_status="SUCCESS_NO_NEW_REVIEWS",
+        last_checked_at="2026-10-02T12:00:00Z",
+        last_rating=4.8,
+        total_reviews_count=293,
+    )
+
+    text = reviews_sources_text([s])
+    assert "⭐ 4.8 (293)" in text
+    assert "УО Датахаб" in text
 
