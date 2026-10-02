@@ -22,6 +22,7 @@ from app.storage.models import (
     VkComment,
     VkPost,
 )
+from app.reviews.dates import format_msk_datetime
 from app.storage.repositories import AlertRepository, RuntimeSettingsRepository
 
 logger = logging.getLogger(__name__)
@@ -432,7 +433,7 @@ class AlertService:
             source, "branch_name", getattr(review, "branch_name", "Учебное отделение")
         )
         author = getattr(review, "author_name", "Аноним") or "Аноним"
-        published_at = getattr(review, "published_at", "")
+        published_at = format_msk_datetime(getattr(review, "published_at", ""))
         raw_text = getattr(review, "text", "") or "(без текста)"
         if raw_text.strip() == "TEXT_EMPTY":
             raw_text = "(без текста)"

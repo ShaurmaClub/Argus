@@ -2,6 +2,7 @@ from html import escape
 from typing import Any
 
 from app.modules import ModuleInfo, ModuleRegistry, ModuleStatus
+from app.reviews.dates import format_msk_datetime
 
 STATUS_ICON = {
     ModuleStatus.OK: "✅",
@@ -135,7 +136,8 @@ async def reviews_menu_text(stats: dict, sched_status: dict, config: Any) -> str
     health = sched_status.get("health_status", "UNKNOWN")
     health_icon = "✅" if health == "HEALTHY" else ("⏸️" if health == "IDLE_DISABLED" else "⚠️")
 
-    last_cycle = sched_status.get("last_completed_cycle_at") or "еще не выполнялся"
+    raw_cycle = sched_status.get("last_completed_cycle_at")
+    last_cycle = format_msk_datetime(raw_cycle) if raw_cycle else "еще не выполнялся"
     poll_min = max(1, config.poll_interval_seconds // 60)
 
     return "\n".join(
@@ -173,7 +175,8 @@ def reviews_sources_text(sources: list) -> str:
             else ("🟡" if getattr(s, "last_status", "") == "PENDING" else "🔴")
         )
         branch = getattr(s, "branch_name", "Филиал")
-        last_chk = getattr(s, "last_checked_at", None) or "не проверялся"
+        raw_chk = getattr(s, "last_checked_at", None)
+        last_chk = format_msk_datetime(raw_chk) if raw_chk else "не проверялся"
         rating_str = (
             f" ⭐ {s.last_rating:.1f}" if getattr(s, "last_rating", None) is not None else ""
         )

@@ -78,8 +78,10 @@ class DGisReviewsClient:
         api_base = f"https://public-api.reviews.2gis.com/3.0/branches/{source.external_id}/reviews"
 
         for attempt in range(2):
+            offset = max(0, (page - 1) * page_size)
             params = {
                 "limit": str(page_size),
+                "offset": str(offset),
                 "page": str(page),
                 "sort_by": "date_created",
                 "key": self._api_key,

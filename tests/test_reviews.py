@@ -2436,3 +2436,42 @@ async def test_module_registry_reviews_status_crashing_and_degraded(test_env):
     assert info_degraded.status != ModuleStatus.OK
     assert info_degraded.is_available is False
     assert "Sources degraded: 1" in info_degraded.reason
+
+
+# ==============================================================================
+# 41. Date formatting in MSK without milliseconds/microseconds
+# ==============================================================================
+def test_format_msk_datetime():
+    from app.reviews.dates import format_msk_datetime
+
+    # 1. UTC Z date
+    d1 = "2026-10-01T16:32:34.241Z"
+    assert format_msk_datetime(d1) == "01.10.2026 19:32:34 МСК"
+
+    # 2. Offset +07:00 date (2GIS)
+    d2 = "2026-10-02T00:37:12.74127+07:00"
+    assert format_msk_datetime(d2) == "01.10.2026 20:37:12 МСК"
+
+    # 3. Microseconds +00:00
+    d3 = "2026-10-01T20:13:12.476877+00:00"
+    assert format_msk_datetime(d3) == "01.10.2026 23:13:12 МСК"
+
+    # 4. None / empty
+    assert format_msk_datetime(None) == "—"
+    assert format_msk_datetime("") == "—"
+
+
+# ==============================================================================
+# 42. Python 3.10 asyncio.TimeoutError compatibility in scheduler loop
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_scheduler_timeout_error_compatibility(test_env):
+    scheduler = ReviewsPollingScheduler(
+        settings=test_env["settings"],
+        service=test_env["service"],
+    )
+    # Simulate a poll cycle where wait_for times out in Python 3.10 style
+    # It must not increment _consecutive_loop_crashes
+    await scheduler._poll_cycle(wait_after=False)
+    assert scheduler.consecutive_crashes == 0
+

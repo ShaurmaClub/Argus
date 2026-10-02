@@ -345,10 +345,15 @@ class ReviewsService:
 
         # Handle Deduplication & New Reviews
         new_items: list[ReviewItem] = []
+        seen_ids: set[str] = set()
         for it in items:
-            is_known = await self.repository.is_review_known(it.platform, it.external_review_id)
+            rev_id = str(it.external_review_id)
+            if rev_id in seen_ids:
+                continue
+            is_known = await self.repository.is_review_known(it.platform, rev_id)
             if not is_known:
                 new_items.append(it)
+                seen_ids.add(rev_id)
 
         # Catch-up during downtime
         # If page 1 had >=1 new review AND page 1 was full,
@@ -409,11 +414,15 @@ class ReviewsService:
 
                 page_new_count = 0
                 for it in c_items:
+                    rev_id = str(it.external_review_id)
+                    if rev_id in seen_ids:
+                        continue
                     is_known = await self.repository.is_review_known(
-                        it.platform, it.external_review_id
+                        it.platform, rev_id
                     )
                     if not is_known:
                         new_items.append(it)
+                        seen_ids.add(rev_id)
                         page_new_count += 1
 
                 total_fetched += len(c_items)
