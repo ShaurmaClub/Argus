@@ -60,11 +60,11 @@ class YandexReviewsClient:
 
     @property
     def _last_rating(self) -> float | None:
-        return next(iter(self._branch_ratings.values()), None)
+        return None
 
     @property
     def _last_count(self) -> int | None:
-        return next(iter(self._branch_counts.values()), None)
+        return None
 
     async def close(self) -> None:
         pass
@@ -99,13 +99,17 @@ class YandexReviewsClient:
                         val = rating_data.get("ratingValue")
                         if val is not None:
                             try:
-                                rating = round(float(val), 1)
+                                r_val = round(float(val), 1)
+                                if 1.0 <= r_val <= 5.0:
+                                    rating = r_val
                             except (ValueError, TypeError):
                                 pass
                         cnt = rating_data.get("reviewCount")
                         if cnt is not None:
                             try:
-                                count = int(cnt)
+                                c_val = int(cnt)
+                                if c_val >= 0:
+                                    count = c_val
                             except (ValueError, TypeError):
                                 pass
                         return rating, count
@@ -133,11 +137,13 @@ class YandexReviewsClient:
 
             rating, count = self._parse_page_metadata(html)
             self._ratings_updated_at[source.external_id] = time.time()
-            if rating is not None:
+            if rating is not None and 1.0 <= rating <= 5.0:
                 self._branch_ratings[source.external_id] = rating
             if count is not None:
-                self._branch_counts[source.external_id] = count
-            return rating
+                prev_cnt = self._branch_counts.get(source.external_id)
+                if count > 0 or prev_cnt is None or prev_cnt == 0:
+                    self._branch_counts[source.external_id] = count
+            return self._branch_ratings.get(source.external_id)
         except Exception as exc:
             logger.debug("Failed to fetch branch rating for %s: %s", source.branch_name, exc)
             return None
@@ -194,10 +200,12 @@ class YandexReviewsClient:
 
             rating, count = self._parse_page_metadata(html)
             self._ratings_updated_at[source.external_id] = time.time()
-            if rating is not None:
+            if rating is not None and 1.0 <= rating <= 5.0:
                 self._branch_ratings[source.external_id] = rating
             if count is not None:
-                self._branch_counts[source.external_id] = count
+                prev_c = self._branch_counts.get(source.external_id)
+                if count > 0 or prev_c is None or prev_c == 0:
+                    self._branch_counts[source.external_id] = count
 
             if not self._csrf_token or not self._session_id:
                 return ReviewSyncStatus.PARSER_FORMAT_CHANGED, "Missing csrfToken or sessionId", 200
@@ -284,7 +292,10 @@ class YandexReviewsClient:
                     params_dict = data["data"].get("params", {})
                     if isinstance(params_dict, dict) and "count" in params_dict:
                         try:
-                            self._branch_counts[source.external_id] = int(params_dict["count"])
+                            new_cnt = int(params_dict["count"])
+                            prev_c = self._branch_counts.get(source.external_id)
+                            if new_cnt > 0 or prev_c is None or prev_c == 0:
+                                self._branch_counts[source.external_id] = new_cnt
                         except (ValueError, TypeError):
                             pass
 

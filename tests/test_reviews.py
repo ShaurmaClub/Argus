@@ -2618,3 +2618,89 @@ def test_screens_reviews_sources_text_with_rating_and_count():
     assert "⭐ 4.8 (293)" in text
     assert "УО Датахаб" in text
 
+
+# ==============================================================================
+# 46. Transient zero rating and count drop never triggers alert and never corrupts DB
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_transient_zero_rating_and_count_never_triggers_alert_and_never_corrupts_db(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    bot = test_env["bot"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1092943436")
+
+    # 1. Initialize source with 5.0 rating and 189 reviews
+    await bundle.reviews.mark_source_initialized(source.id)
+    await bundle.reviews.update_source_status(
+        source.id,
+        status="SUCCESS_NO_NEW_REVIEWS",
+        checked_at=datetime.now(UTC).isoformat(),
+        success=True,
+        last_rating=5.0,
+        total_reviews_count=189,
+    )
+    s_updated = await bundle.reviews.get_source_by_id(source.id)
+    assert s_updated.last_rating == 5.0
+    assert s_updated.total_reviews_count == 189
+
+    # 2. Simulate Yandex transient glitch returning rating=0.0 and count=0
+    test_env["yandex_client"].reviews_to_return = []
+
+    async def mock_fetch_transient_zero(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 0.0, 0
+
+    test_env["yandex_client"].fetch_reviews = mock_fetch_transient_zero
+
+    bot.sent_messages.clear()
+    await service.sync_source(s_updated)
+
+    # Must NOT send any rating change alert to telegram
+    assert len(bot.sent_messages) == 0
+
+    # DB must preserve valid 5.0 rating and 189 reviews
+    s_after = await bundle.reviews.get_source_by_id(source.id)
+    assert s_after.last_rating == 5.0
+    assert s_after.total_reviews_count == 189
+
+    # 3. Next cycle returns normal 5.0 and 189 again
+    async def mock_fetch_normal(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 189
+
+    test_env["yandex_client"].fetch_reviews = mock_fetch_normal
+    bot.sent_messages.clear()
+    await service.sync_source(s_after)
+
+    # Must NOT send any alert either (no false 0.0 -> 5.0 jump)
+    assert len(bot.sent_messages) == 0
+
+
+# ==============================================================================
+# 47. Yandex and 2GIS clients reject invalid rating <= 0 or > 5
+# ==============================================================================
+def test_yandex_client_rejects_zero_rating():
+    from app.reviews.client_yandex import YandexReviewsClient
+
+    client = YandexReviewsClient()
+    # HTML with ratingValue: 0
+    html_zero = """
+    <script type="application/json">
+    {"stack": [{"results": {"items": [{"ratingData": {"ratingValue": 0, "reviewCount": 0}}]}}]}
+    </script>
+    """
+    rating, count = client._parse_page_metadata(html_zero)
+    assert rating is None
+    assert count == 0
+
+    # HTML with valid rating
+    html_valid = """
+    <script type="application/json">
+    {"stack": [{"results": {"items": [{"ratingData": {"ratingValue": 4.9, "reviewCount": 50}}]}}]}
+    </script>
+    """
+    r_val, c_val = client._parse_page_metadata(html_valid)
+    assert r_val == 4.9
+    assert c_val == 50
+
+

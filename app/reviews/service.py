@@ -203,8 +203,8 @@ class ReviewsService:
                 source, page=1, page_size=config.fetch_page_size
             )
             status, items, err, http_code = res[:4]
-            branch_rating = res[4] if len(res) >= 5 else getattr(client, "_last_rating", None)
-            total_count = res[5] if len(res) >= 6 else getattr(client, "_last_count", None)
+            branch_rating = res[4] if len(res) >= 5 else None
+            total_count = res[5] if len(res) >= 6 else None
         elif source.platform == ReviewPlatform.DGIS:
             d_client = self._get_dgis_client()
             (
@@ -221,6 +221,37 @@ class ReviewsService:
                 status=ReviewSyncStatus.UNKNOWN_ERROR,
                 error_message=f"Unsupported platform: {source.platform}",
             )
+
+        # Validate rating and review count from platform response
+        if branch_rating is not None:
+            try:
+                b_rating_val = round(float(branch_rating), 1)
+                branch_rating = b_rating_val if 1.0 <= b_rating_val <= 5.0 else None
+            except (ValueError, TypeError):
+                branch_rating = None
+
+        # Guard against transient zeroes for count: never overwrite known positive count with 0
+        if total_count is not None:
+            try:
+                t_count_val = int(total_count)
+                if t_count_val < 0:
+                    total_count = None
+                elif (
+                    t_count_val == 0
+                    and source.total_reviews_count is not None
+                    and source.total_reviews_count > 0
+                ):
+                    logger.warning(
+                        "Source %s (%s) reported 0 total reviews while previously having %d; ignoring transient drop.",
+                        source.branch_name,
+                        source.platform,
+                        source.total_reviews_count,
+                    )
+                    total_count = source.total_reviews_count
+                else:
+                    total_count = t_count_val
+            except (ValueError, TypeError):
+                total_count = None
 
         # Handle failure
         if status not in (
@@ -327,6 +358,11 @@ class ReviewsService:
             )
             await self.repository.save_reviews(baseline_items, source.id, mark_sent=True)
             await self.repository.mark_source_initialized(source.id)
+            baseline_effective_rating = (
+                branch_rating
+                if (branch_rating is not None and 1.0 <= branch_rating <= 5.0)
+                else None
+            )
             await self.repository.update_source_status(
                 source.id,
                 status="SUCCESS",
@@ -336,7 +372,7 @@ class ReviewsService:
                 health_alert_active=health_alert_active,
                 health_alert_sent_at=None,
                 backoff_until=None,
-                last_rating=branch_rating,
+                last_rating=baseline_effective_rating,
                 total_reviews_count=total_count,
             )
             return ReviewSyncResult(
@@ -462,11 +498,23 @@ class ReviewsService:
             status = ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
 
         # Check for rating change alert
+        # Both old and new ratings must be valid values in [1.0, 5.0] to prevent ghost alerts
+        # from transient zero/unrated responses
+        old_rating_val: float | None = None
+        if source.last_rating is not None:
+            try:
+                r_val = round(float(source.last_rating), 1)
+                if 1.0 <= r_val <= 5.0:
+                    old_rating_val = r_val
+            except (ValueError, TypeError):
+                old_rating_val = None
+
         if (
             source.is_initialized
-            and source.last_rating is not None
+            and old_rating_val is not None
             and branch_rating is not None
-            and round(float(source.last_rating), 1) != round(float(branch_rating), 1)
+            and 1.0 <= branch_rating <= 5.0
+            and old_rating_val != branch_rating
             and config.alerts_enabled
             and self.alerts
         ):
@@ -475,17 +523,29 @@ class ReviewsService:
                     "Rating changed for %s (%s): %s -> %s",
                     source.branch_name,
                     source.platform,
-                    source.last_rating,
+                    old_rating_val,
                     branch_rating,
                 )
                 await self.alerts.send_rating_change_alert(
                     source=source,
-                    old_rating=round(float(source.last_rating), 1),
-                    new_rating=round(float(branch_rating), 1),
-                    total_count=total_count,
+                    old_rating=old_rating_val,
+                    new_rating=branch_rating,
+                    total_count=total_count if total_count is not None else source.total_reviews_count,
                 )
             except Exception as rating_exc:
                 logger.error("Failed to send rating change alert: %s", rating_exc)
+
+        # Do not overwrite valid last_rating with None if branch_rating failed to fetch
+        effective_rating = (
+            branch_rating
+            if (branch_rating is not None and 1.0 <= branch_rating <= 5.0)
+            else source.last_rating
+        )
+        effective_count = (
+            total_count
+            if (total_count is not None and (total_count > 0 or not source.total_reviews_count))
+            else source.total_reviews_count
+        )
 
         await self.repository.update_source_status(
             source.id,
@@ -496,8 +556,8 @@ class ReviewsService:
             health_alert_active=health_alert_active,
             health_alert_sent_at=None,
             backoff_until=None,
-            last_rating=branch_rating,
-            total_reviews_count=total_count,
+            last_rating=effective_rating,
+            total_reviews_count=effective_count,
         )
 
         return ReviewSyncResult(

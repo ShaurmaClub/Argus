@@ -1306,8 +1306,13 @@ class ReviewRepository:
             fields.append("backoff_until = NULL")
 
         if last_rating is not None:
-            fields.append("last_rating = ?")
-            params.append(last_rating)
+            try:
+                lr_val = round(float(last_rating), 1)
+                if 1.0 <= lr_val <= 5.0:
+                    fields.append("last_rating = ?")
+                    params.append(lr_val)
+            except (ValueError, TypeError):
+                pass
 
         if total_reviews_count is not None:
             fields.append("total_reviews_count = ?")

@@ -151,14 +151,23 @@ class DGisReviewsClient:
                         )
                     reviews_data = data["reviews"]
                     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
-                    branch_rating = (
-                        float(meta["branch_rating"])
-                        if meta.get("branch_rating") is not None
-                        else None
-                    )
-                    total_count = (
-                        int(meta["total_count"]) if meta.get("total_count") is not None else None
-                    )
+                    branch_rating = None
+                    if meta.get("branch_rating") is not None:
+                        try:
+                            b_r = round(float(meta["branch_rating"]), 1)
+                            if 1.0 <= b_r <= 5.0:
+                                branch_rating = b_r
+                        except (ValueError, TypeError):
+                            pass
+
+                    total_count = None
+                    if meta.get("total_count") is not None:
+                        try:
+                            c_v = int(meta["total_count"])
+                            if c_v >= 0:
+                                total_count = c_v
+                        except (ValueError, TypeError):
+                            pass
 
                     items: list[ReviewItem] = []
                     for r in reviews_data:
