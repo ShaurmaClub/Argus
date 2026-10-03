@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -330,7 +331,40 @@ class GeminiReviewWorker:
         self.queue: asyncio.Queue[int] = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._stopped = False
-        self._quota_paused = False
+        self.quota_cooldown_seconds: float = getattr(
+            settings, "gemini_quota_cooldown_seconds", 3600.0
+        )
+        self._quota_paused: bool = False
+        self._quota_paused_at: float | None = None
+
+    def is_quota_paused(self) -> bool:
+        if not self._quota_paused:
+            return False
+        if self._quota_paused_at is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                now = loop.time()
+            except RuntimeError:
+                now = time.time()
+            if now - self._quota_paused_at >= self.quota_cooldown_seconds:
+                logger.info("Gemini quota pause cooldown expired, re-enabling requests")
+                self._quota_paused = False
+                self._quota_paused_at = None
+                return False
+        return True
+
+    def pause_quota(self, cooldown_seconds: float | None = None) -> None:
+        self._quota_paused = True
+        try:
+            loop = asyncio.get_running_loop()
+            self._quota_paused_at = loop.time()
+        except RuntimeError:
+            self._quota_paused_at = time.time()
+        if cooldown_seconds is not None:
+            self.quota_cooldown_seconds = cooldown_seconds
+        logger.warning(
+            "Gemini quota paused for %s seconds", self.quota_cooldown_seconds
+        )
 
     def get_client(self) -> GeminiReviewClient:
         if self._client is None:
@@ -349,8 +383,11 @@ class GeminiReviewWorker:
         return self._client
 
     async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
         self._stopped = False
         self._quota_paused = False
+        self._quota_paused_at = None
         # Recover pending analyses from SQLite on startup/restart
         pending_reviews = await self.repository.get_pending_ai_reviews(limit=100)
         for rev in pending_reviews:
@@ -445,10 +482,12 @@ class GeminiReviewWorker:
                 retry_count=0,
             )
             saved = await self.repository.save_ai_analysis(analysis)
+            if self.alerts:
+                await self._safe_deliver(review_id, saved)
             return saved
 
         # 4. Check if quota paused
-        if self._quota_paused:
+        if self.is_quota_paused():
             analysis = ReviewAiAnalysis(
                 id=existing.id if existing else None,
                 review_id=review_id,
@@ -459,6 +498,8 @@ class GeminiReviewWorker:
                 retry_count=existing.retry_count if existing else 0,
             )
             saved = await self.repository.save_ai_analysis(analysis)
+            if self.alerts:
+                await self._safe_deliver(review_id, saved)
             return saved
 
         # 5. Execute Gemini call
@@ -492,10 +533,9 @@ class GeminiReviewWorker:
                 res.sentiment,
                 res.severity,
             )
-            return saved
 
         except GeminiQuotaPausedError:
-            self._quota_paused = True
+            self.pause_quota()
             analysis = ReviewAiAnalysis(
                 id=existing.id if existing else None,
                 review_id=review_id,
@@ -521,32 +561,57 @@ class GeminiReviewWorker:
             saved = await self.repository.save_ai_analysis(analysis)
             logger.error("Failed to analyze review %s with Gemini: %s", review_id, err_type)
 
-        # Trigger delivery to Telegram if not already delivered
-        if self.alerts and not review.is_sent_to_telegram:
-            source = (
-                await self.repository.get_source_by_id(review.source_id)
-                if review.source_id
-                else None
-            )
-            if source is None:
-                sources = await self.repository.list_sources()
-                for s in sources:
-                    if s.branch_name == review.branch_name and s.platform == review.platform:
-                        source = s
-                        break
-            if source is not None:
-                try:
-                    await self.alerts.send_review_alert(
-                        review=review,
-                        source=source,
-                        repo=self.repository,
-                        ai_analysis=saved,
-                    )
-                except Exception as deliv_exc:
-                    logger.error(
-                        "Failed to deliver review %s to Telegram from worker: %s",
-                        review_id,
-                        deliv_exc,
-                    )
+        # Trigger safe delivery to Telegram if not already delivered
+        if self.alerts:
+            await self._safe_deliver(review_id, saved)
 
         return saved
+
+    async def _safe_deliver(
+        self,
+        review_id: int,
+        ai_analysis: ReviewAiAnalysis | None = None,
+    ) -> bool:
+        if not self.alerts:
+            return False
+
+        fresh_review = await self.repository.get_review_by_id(review_id)
+        if fresh_review is None or fresh_review.is_sent_to_telegram:
+            return False
+
+        source = (
+            await self.repository.get_source_by_id(fresh_review.source_id)
+            if fresh_review.source_id
+            else None
+        )
+        if source is None:
+            sources = await self.repository.list_sources()
+            for s in sources:
+                if (
+                    s.branch_name == fresh_review.branch_name
+                    and s.platform == fresh_review.platform
+                ):
+                    source = s
+                    break
+
+        if source is None:
+            logger.warning(
+                "Could not find source for review %s in worker delivery",
+                review_id,
+            )
+            return False
+
+        try:
+            return await self.alerts.send_review_alert(
+                review=fresh_review,
+                source=source,
+                repo=self.repository,
+                ai_analysis=ai_analysis,
+            )
+        except Exception as deliv_exc:
+            logger.error(
+                "Failed to deliver review %s to Telegram from worker: %s",
+                review_id,
+                deliv_exc,
+            )
+            return False

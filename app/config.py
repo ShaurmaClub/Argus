@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     gemini_timeout_seconds: float = 15.0
     gemini_max_rpm: int = 10
     gemini_max_retries: int = 3
+    gemini_quota_cooldown_seconds: float = 3600.0
 
     fail_fast: bool = False
     require_vk: bool = False

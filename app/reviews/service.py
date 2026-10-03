@@ -61,8 +61,8 @@ class ReviewsService:
         return self._ai_worker
 
     async def ensure_ai_worker_started(self) -> None:
-        if not self._ai_worker_started:
-            worker = self.get_ai_worker()
+        worker = self.get_ai_worker()
+        if not self._ai_worker_started or worker._task is None or worker._task.done():
             await worker.start()
             self._ai_worker_started = True
 
@@ -83,6 +83,7 @@ class ReviewsService:
             await self._dgis_client.close()
         if self._ai_worker is not None:
             await self._ai_worker.stop()
+            self._ai_worker_started = False
 
     async def effective_config(self) -> ReviewsEffectiveConfig:
         runtime_enabled = await self.runtime_settings.get("enable_reviews_monitor")
@@ -614,6 +615,8 @@ class ReviewsService:
             "enable_gemini_review_analysis",
             self.settings.enable_gemini_review_analysis,
         )
+        if runtime_ai:
+            await self.ensure_ai_worker_started()
 
         unsent = await self.repository.get_unsent_reviews(limit=50)
         sent_count = 0

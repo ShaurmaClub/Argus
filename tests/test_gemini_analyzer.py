@@ -16,6 +16,7 @@ from app.reviews.analyzer import (
     compute_deterministic_verdict,
 )
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource
+from app.reviews.scheduler import ReviewsPollingScheduler
 from app.reviews.service import ReviewsService
 from app.storage.database import Database
 from app.storage.models import ReviewAiAnalysis
@@ -557,3 +558,287 @@ async def test_17_api_key_never_appears_in_logs(caplog):
     for record in caplog.records:
         assert secret_key not in record.message
         assert secret_key not in str(record.args)
+
+
+# ==============================================================================
+# 18. Successful AI analysis immediately leads to Telegram delivery
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_18_successful_analysis_immediately_delivers_to_telegram(gemini_env):
+    bundle = gemini_env["bundle"]
+    settings = gemini_env["settings"]
+    bot = gemini_env["bot"]
+    alerts = gemini_env["alerts"]
+
+    mock_client = AsyncMock()
+    mock_client.model = "gemini-3.5-flash-lite"
+    mock_client.analyze_review.return_value = GeminiAnalysisResult(
+        summary="Отличный центр и классные преподаватели.",
+        sentiment="positive",
+        criticism_found=False,
+        has_hidden_negative=False,
+        stars_text_conflict=False,
+        severity="none",
+        requires_attention=False,
+    )
+
+    worker = GeminiReviewWorker(
+        settings=settings,
+        repository=bundle.reviews,
+        alerts=alerts,
+        client=mock_client,
+    )
+
+    review = ReviewItem(
+        external_review_id="rev_immediate_18",
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Центральное отделение",
+        author_name="Алексей",
+        rating=5,
+        text="Отличный центр и классные преподаватели.",
+        published_at="2026-10-01T12:00:00Z",
+    )
+    await bundle.reviews.save_reviews([review], source_id=1, mark_sent=False)
+    db_rev = await bundle.reviews.get_review_by_external_id("yandex", "rev_immediate_18")
+    assert db_rev is not None
+    assert db_rev.is_sent_to_telegram is False
+
+    # Process review with worker
+    res = await worker.process_review(db_rev.id)
+    assert res is not None
+    assert res.status == "SUCCESS"
+    assert res.verdict == "GREEN"
+
+    # Must be delivered IMMEDIATELY without calling deliver_pending_reviews()
+    assert len(bot.sent_messages) == 1
+    assert "🟢" in bot.sent_messages[0]["text"]
+    assert "Отличный центр" in bot.sent_messages[0]["text"]
+
+    # In database, review must be marked as sent
+    updated_rev = await bundle.reviews.get_review_by_id(db_rev.id)
+    assert updated_rev is not None
+    assert updated_rev.is_sent_to_telegram is True
+
+
+# ==============================================================================
+# 19. No duplicate Telegram delivery on worker / deliver_pending_reviews race
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_19_no_duplicate_telegram_delivery_on_worker_and_service_race(gemini_env):
+    bundle = gemini_env["bundle"]
+    settings = gemini_env["settings"]
+    bot = gemini_env["bot"]
+    alerts = gemini_env["alerts"]
+
+    mock_client = AsyncMock()
+    mock_client.model = "gemini-3.5-flash-lite"
+    mock_client.analyze_review.return_value = GeminiAnalysisResult(
+        summary="Всё супер.",
+        sentiment="positive",
+        criticism_found=False,
+        has_hidden_negative=False,
+        stars_text_conflict=False,
+        severity="none",
+        requires_attention=False,
+    )
+
+    worker = GeminiReviewWorker(
+        settings=settings,
+        repository=bundle.reviews,
+        alerts=alerts,
+        client=mock_client,
+    )
+    service = ReviewsService(
+        settings=settings,
+        runtime_settings=bundle.runtime_settings,
+        repository=bundle.reviews,
+        alerts=alerts,
+        ai_worker=worker,
+    )
+
+    review = ReviewItem(
+        external_review_id="rev_race_19",
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Центральное отделение",
+        author_name="Иван",
+        rating=5,
+        text="Всё супер.",
+        published_at="2026-10-01T12:00:00Z",
+    )
+    await bundle.reviews.save_reviews([review], source_id=1, mark_sent=False)
+    db_rev = await bundle.reviews.get_review_by_external_id("yandex", "rev_race_19")
+    assert db_rev is not None
+
+    # Run worker.process_review and service.deliver_pending_reviews concurrently
+    results = await asyncio.gather(
+        worker.process_review(db_rev.id),
+        service.deliver_pending_reviews(),
+        return_exceptions=True,
+    )
+    for r in results:
+        assert not isinstance(r, Exception), f"Concurrent execution raised: {r}"
+
+    # Exactly ONE Telegram message must be sent
+    assert len(bot.sent_messages) == 1
+    updated_rev = await bundle.reviews.get_review_by_id(db_rev.id)
+    assert updated_rev.is_sent_to_telegram is True
+    await service.close()
+
+
+# ==============================================================================
+# 20. PENDING review after simulated restart processed without new reviews
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_20_pending_review_processed_after_simulated_restart_without_new_reviews(gemini_env):
+    bundle = gemini_env["bundle"]
+    settings = gemini_env["settings"]
+    bot = gemini_env["bot"]
+    alerts = gemini_env["alerts"]
+
+    # 1. Review is saved in SQLite before restart (AI=PENDING, is_sent_to_telegram=0)
+    review = ReviewItem(
+        external_review_id="rev_restart_20",
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Центральное отделение",
+        author_name="Дмитрий",
+        rating=5,
+        text="Хорошая подготовка к экзаменам",
+        published_at="2026-10-01T12:00:00Z",
+    )
+    await bundle.reviews.save_reviews([review], source_id=1, mark_sent=False)
+    db_rev = await bundle.reviews.get_review_by_external_id("yandex", "rev_restart_20")
+    assert db_rev is not None
+    assert db_rev.is_sent_to_telegram is False
+
+    ai_rec = await bundle.reviews.get_ai_analysis(db_rev.id)
+    assert ai_rec is not None
+    assert ai_rec.status == "PENDING"
+
+    # 2. Simulate process restart: create a new ReviewsService and scheduler
+    mock_client = AsyncMock()
+    mock_client.model = "gemini-3.5-flash-lite"
+    mock_client.analyze_review.return_value = GeminiAnalysisResult(
+        summary="Хорошая подготовка к экзаменам.",
+        sentiment="positive",
+        criticism_found=False,
+        has_hidden_negative=False,
+        stars_text_conflict=False,
+        severity="none",
+        requires_attention=False,
+    )
+
+    worker = GeminiReviewWorker(
+        settings=settings,
+        repository=bundle.reviews,
+        alerts=alerts,
+        client=mock_client,
+    )
+
+    mock_yandex = AsyncMock()
+    mock_yandex.fetch_reviews.return_value = []
+    mock_yandex.extract_rating_and_count.return_value = (None, None)
+
+    new_service = ReviewsService(
+        settings=settings,
+        runtime_settings=bundle.runtime_settings,
+        repository=bundle.reviews,
+        alerts=alerts,
+        yandex_client=mock_yandex,
+        ai_worker=worker,
+    )
+    scheduler = ReviewsPollingScheduler(settings=settings, service=new_service)
+
+    # 3. Scheduler runs poll cycle with 0 new reviews
+    await scheduler._poll_cycle(wait_after=False)
+
+    # Wait for background worker to process recovered review
+    for _ in range(50):
+        if len(bot.sent_messages) > 0:
+            break
+        await asyncio.sleep(0.05)
+
+    assert len(bot.sent_messages) == 1
+    assert "Хорошая подготовка" in bot.sent_messages[0]["text"]
+
+    updated_ai = await bundle.reviews.get_ai_analysis(db_rev.id)
+    assert updated_ai is not None
+    assert updated_ai.status == "SUCCESS"
+    assert updated_ai.verdict == "GREEN"
+
+    await new_service.close()
+
+
+# ==============================================================================
+# 21. Quota pause recovers after cooldown
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_21_quota_pause_recovers_after_cooldown(gemini_env):
+    bundle = gemini_env["bundle"]
+    settings = gemini_env["settings"]
+    alerts = gemini_env["alerts"]
+
+    mock_client = AsyncMock()
+    mock_client.model = "gemini-3.5-flash-lite"
+    mock_client.analyze_review.return_value = GeminiAnalysisResult(
+        summary="Отличный сервис после кулдауна.",
+        sentiment="positive",
+        criticism_found=False,
+        has_hidden_negative=False,
+        stars_text_conflict=False,
+        severity="none",
+        requires_attention=False,
+    )
+
+    worker = GeminiReviewWorker(
+        settings=settings,
+        repository=bundle.reviews,
+        alerts=alerts,
+        client=mock_client,
+    )
+
+    # Save 2 reviews
+    rev1 = ReviewItem(
+        external_review_id="rev_qp_1",
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Центральное отделение",
+        author_name="Ольга",
+        rating=5,
+        text="Первый отзыв",
+        published_at="2026-10-01T12:00:00Z",
+    )
+    rev2 = ReviewItem(
+        external_review_id="rev_qp_2",
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Центральное отделение",
+        author_name="Сергей",
+        rating=5,
+        text="Второй отзыв",
+        published_at="2026-10-01T12:01:00Z",
+    )
+    await bundle.reviews.save_reviews([rev1, rev2], source_id=1, mark_sent=False)
+    db_rev1 = await bundle.reviews.get_review_by_external_id("yandex", "rev_qp_1")
+    db_rev2 = await bundle.reviews.get_review_by_external_id("yandex", "rev_qp_2")
+    assert db_rev1 is not None
+    assert db_rev2 is not None
+
+    # 1. Trigger quota pause with 0.15s cooldown
+    worker.pause_quota(cooldown_seconds=0.15)
+    assert worker.is_quota_paused() is True
+
+    # 2. Process review 1 while quota paused -> must NOT call analyze_review
+    res1 = await worker.process_review(db_rev1.id)
+    assert res1 is not None
+    assert res1.status == "QUOTA_PAUSED"
+    assert res1.verdict == "UNKNOWN"
+    mock_client.analyze_review.assert_not_called()
+
+    # 3. Wait for cooldown to expire
+    await asyncio.sleep(0.2)
+    assert worker.is_quota_paused() is False
+
+    # 4. Process review 2 after cooldown -> must call analyze_review and succeed
+    res2 = await worker.process_review(db_rev2.id)
+    assert res2 is not None
+    assert res2.status == "SUCCESS"
+    assert res2.verdict == "GREEN"
+    assert mock_client.analyze_review.call_count == 1
