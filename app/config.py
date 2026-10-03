@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", "secrets/gemini.env"),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     reviews_error_alert_threshold: int = 3
     reviews_max_backoff_seconds: int = 7200
     alerts_reviews_enabled: bool = True
+
+    enable_gemini_review_analysis: bool = False
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_timeout_seconds: float = 15.0
+    gemini_max_rpm: int = 10
+    gemini_max_retries: int = 3
 
     fail_fast: bool = False
     require_vk: bool = False
@@ -98,6 +105,7 @@ class Settings(BaseSettings):
         "vk_group_token",
         "vk_user_access_token",
         "tg_api_hash",
+        "gemini_api_key",
         mode="before",
     )
     @classmethod

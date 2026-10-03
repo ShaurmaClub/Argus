@@ -14,6 +14,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
 from app.config import Settings
+from app.reviews.dates import format_msk_datetime
 from app.storage.models import (
     Post,
     Source,
@@ -22,7 +23,6 @@ from app.storage.models import (
     VkComment,
     VkPost,
 )
-from app.reviews.dates import format_msk_datetime
 from app.storage.repositories import AlertRepository, RuntimeSettingsRepository
 
 logger = logging.getLogger(__name__)
@@ -421,7 +421,12 @@ class AlertService:
 
         return chunks if chunks else [raw_text]
 
-    def _render_review_parts(self, review: Any, source: Any) -> list[str]:
+    def _render_review_parts(
+        self,
+        review: Any,
+        source: Any,
+        ai_analysis: Any | None = None,
+    ) -> list[str]:
         platform_name = "Яндекс.Карты" if getattr(review, "platform", "") == "yandex" else "2ГИС"
         rating_num = getattr(review, "rating", 0) or 0
         stars = (
@@ -441,8 +446,33 @@ class AlertService:
         review_url = getattr(review, "review_url", None)
         link_html = f'\n\n🔗 <a href="{escape(review_url)}">Открыть отзыв</a>' if review_url else ""
 
+        ai_header_block = ""
+        if ai_analysis is not None:
+            status = getattr(ai_analysis, "status", None)
+            verdict = getattr(ai_analysis, "verdict", "UNKNOWN")
+            if status == "SUCCESS":
+                badge_map = {
+                    "GREEN": "🟢 <b>Позитивный отзыв</b>",
+                    "YELLOW": "🟡 <b>Есть замечания</b>",
+                    "RED": "🔴 <b>Требует внимания</b>",
+                }
+                badge = badge_map.get(verdict, "")
+                lines = []
+                if badge:
+                    lines.append(badge)
+                summary = getattr(ai_analysis, "summary", None)
+                if summary:
+                    lines.append(f"🧠 <b>Кратко:</b> {escape(summary)}")
+                if getattr(ai_analysis, "stars_text_conflict", False):
+                    lines.append("⚠️ <i>Оценка может не соответствовать содержанию текста.</i>")
+                if lines:
+                    ai_header_block = "\n".join(lines) + "\n\n"
+            elif status in ("AI_ERROR", "QUOTA_PAUSED"):
+                ai_header_block = "⚪ <i>ИИ-анализ временно недоступен</i>\n\n"
+
         header_full = (
             "🆕 <b>Новый отзыв</b>\n\n"
+            f"{ai_header_block}"
             f"<b>Площадка:</b> {escape(platform_name)}\n"
             f"<b>Учебное отделение:</b> {escape(branch_name)}\n"
             f"<b>Автор:</b> {escape(author)}\n"
@@ -480,13 +510,20 @@ class AlertService:
         self,
         review: Any,
         source: Any,
-        repo: Any,
+        repo: Any = None,
+        ai_analysis: Any | None = None,
     ) -> bool:
         if not await self._reviews_alert_enabled():
             logger.info("Reviews alert skipped: disabled in settings")
             return False
 
-        chunks = self._render_review_parts(review, source)
+        if ai_analysis is None and repo is not None and getattr(review, "id", None):
+            try:
+                ai_analysis = await repo.get_ai_analysis(review.id)
+            except Exception as exc:
+                logger.warning("Could not fetch ai_analysis for review %s: %s", review.id, exc)
+
+        chunks = self._render_review_parts(review, source, ai_analysis=ai_analysis)
         total_parts = len(chunks)
         targets = self._alert_targets()
 

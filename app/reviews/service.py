@@ -10,6 +10,7 @@ except ImportError:
 
 from app.alerts.service import AlertService
 from app.config import Settings
+from app.reviews.analyzer import GeminiReviewWorker
 from app.reviews.client_2gis import DGisReviewsClient
 from app.reviews.client_yandex import YandexReviewsClient
 from app.reviews.models import (
@@ -37,6 +38,7 @@ class ReviewsService:
         alerts: AlertService,
         yandex_client: YandexReviewsClient | None = None,
         dgis_client: DGisReviewsClient | None = None,
+        ai_worker: GeminiReviewWorker | None = None,
     ) -> None:
         self.settings = settings
         self.runtime_settings = runtime_settings
@@ -46,6 +48,23 @@ class ReviewsService:
         self._dgis_client = dgis_client
         self._sync_lock = asyncio.Lock()
         self._default_sources_seeded = False
+        self._ai_worker = ai_worker
+        self._ai_worker_started = False
+
+    def get_ai_worker(self) -> GeminiReviewWorker:
+        if self._ai_worker is None:
+            self._ai_worker = GeminiReviewWorker(
+                settings=self.settings,
+                repository=self.repository,
+                alerts=self.alerts,
+            )
+        return self._ai_worker
+
+    async def ensure_ai_worker_started(self) -> None:
+        if not self._ai_worker_started:
+            worker = self.get_ai_worker()
+            await worker.start()
+            self._ai_worker_started = True
 
     def _get_yandex_client(self) -> YandexReviewsClient:
         if self._yandex_client is None:
@@ -62,6 +81,8 @@ class ReviewsService:
             await self._yandex_client.close()
         if self._dgis_client is not None:
             await self._dgis_client.close()
+        if self._ai_worker is not None:
+            await self._ai_worker.stop()
 
     async def effective_config(self) -> ReviewsEffectiveConfig:
         runtime_enabled = await self.runtime_settings.get("enable_reviews_monitor")
@@ -242,7 +263,8 @@ class ReviewsService:
                     and source.total_reviews_count > 0
                 ):
                     logger.warning(
-                        "Source %s (%s) reported 0 total reviews while previously having %d; ignoring transient drop.",
+                        "Source %s (%s) reported 0 total reviews while previously having %d; "
+                        "ignoring transient drop.",
                         source.branch_name,
                         source.platform,
                         source.total_reviews_count,
@@ -494,6 +516,15 @@ class ReviewsService:
                 source.branch_name,
                 source.platform,
             )
+            runtime_ai = await self.runtime_settings.get_bool(
+                "enable_gemini_review_analysis",
+                self.settings.enable_gemini_review_analysis,
+            )
+            if runtime_ai:
+                await self.ensure_ai_worker_started()
+                for r in new_items:
+                    if r.id is not None:
+                        self.get_ai_worker().enqueue(r.id)
         else:
             status = ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
 
@@ -526,11 +557,16 @@ class ReviewsService:
                     old_rating_val,
                     branch_rating,
                 )
+                effective_cnt = (
+                    total_count
+                    if total_count is not None
+                    else source.total_reviews_count
+                )
                 await self.alerts.send_rating_change_alert(
                     source=source,
                     old_rating=old_rating_val,
                     new_rating=branch_rating,
-                    total_count=total_count if total_count is not None else source.total_reviews_count,
+                    total_count=effective_cnt,
                 )
             except Exception as rating_exc:
                 logger.error("Failed to send rating change alert: %s", rating_exc)
@@ -574,9 +610,19 @@ class ReviewsService:
         if not config.alerts_enabled:
             return 0
 
+        runtime_ai = await self.runtime_settings.get_bool(
+            "enable_gemini_review_analysis",
+            self.settings.enable_gemini_review_analysis,
+        )
+
         unsent = await self.repository.get_unsent_reviews(limit=50)
         sent_count = 0
         for review in unsent:
+            if runtime_ai and getattr(review, "id", None):
+                ai = await self.repository.get_ai_analysis(review.id)
+                if ai is not None and ai.status == "PENDING":
+                    continue
+
             source = (
                 await self.repository.get_source_by_id(review.source_id)
                 if getattr(review, "source_id", None)
