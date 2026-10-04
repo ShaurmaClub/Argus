@@ -57,6 +57,15 @@ class YandexReviewsClient:
         self._branch_ratings: dict[str, float] = {}
         self._branch_counts: dict[str, int] = {}
         self._ratings_updated_at: dict[str, float] = {}
+        self._session_created_at: float = 0.0
+        self._session_ttl_seconds: float = 14400.0  # 4 hours proactive refresh
+
+    def _reset_session(self) -> None:
+        self._csrf_token = None
+        self._session_id = None
+        self._session_created_at = 0.0
+        self._opener = None
+        self._cookie_jar = None
 
     @property
     def _last_rating(self) -> float | None:
@@ -210,6 +219,7 @@ class YandexReviewsClient:
             if not self._csrf_token or not self._session_id:
                 return ReviewSyncStatus.PARSER_FORMAT_CHANGED, "Missing csrfToken or sessionId", 200
 
+            self._session_created_at = time.time()
             return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, None, 200
 
         except urllib.error.HTTPError as exc:
@@ -230,7 +240,16 @@ class YandexReviewsClient:
         page_size: int = 10,
     ) -> tuple[ReviewSyncStatus, list[ReviewItem], str | None, int | None, float | None, int | None]:
         # Step 1: Initialize session credentials if needed
-        if not self._csrf_token or not self._session_id or self._opener is None:
+        now_ts = time.time()
+        is_session_stale = (now_ts - self._session_created_at) > self._session_ttl_seconds
+        if (
+            not self._csrf_token
+            or not self._session_id
+            or self._opener is None
+            or is_session_stale
+        ):
+            if is_session_stale:
+                self._reset_session()
             init_status, err, http_code = self._initialize_session(source)
             if init_status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
                 return (
@@ -280,6 +299,16 @@ class YandexReviewsClient:
                         or not isinstance(data.get("data"), dict)
                         or not isinstance(data["data"].get("reviews"), list)
                     ):
+                        if attempt == 0:
+                            logger.info(
+                                "Yandex fetchReviews returned non-reviews schema (keys: %s), refreshing session before retry...",
+                                list(data.keys()) if isinstance(data, dict) else type(data),
+                            )
+                            self._reset_session()
+                            init_status, err, http_code = self._initialize_session(source)
+                            if init_status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
+                                continue
+
                         return (
                             ReviewSyncStatus.PARSER_FORMAT_CHANGED,
                             [],
@@ -414,8 +443,7 @@ class YandexReviewsClient:
                         "Yandex fetchReviews returned %d, refreshing session before retry...",
                         exc.code,
                     )
-                    self._csrf_token = None
-                    self._session_id = None
+                    self._reset_session()
                     init_status, err, http_code = self._initialize_session(source)
                     if init_status != ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
                         return (

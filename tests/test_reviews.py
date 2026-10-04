@@ -120,6 +120,7 @@ async def test_env(tmp_path: Path):
         alert_chat_id=None,
         admin_ids_text="99999",
         enable_reviews_monitor=True,
+        enable_gemini_review_analysis=False,
         reviews_poll_interval_seconds=900,
         reviews_request_pause_seconds=0.0,
         reviews_fetch_page_size=10,
@@ -1226,6 +1227,85 @@ async def test_yandex_403_refreshes_session_before_retry():
         assert client._csrf_token == "fresh-csrf"
         assert client._session_id == "fresh-session"
         assert len(calls) == 3  # 1st fetchReviews (failed), page visit, 2nd fetchReviews (success)
+
+
+@pytest.mark.asyncio
+async def test_yandex_expired_csrf_http200_refreshes_session_before_retry():
+    client = YandexReviewsClient()
+    source = ReviewSource(
+        id=1,
+        platform=ReviewPlatform.YANDEX,
+        branch_name="Тест",
+        external_id="12345",
+        url="https://yandex.ru/maps/org/test/12345/",
+    )
+
+    client._csrf_token = "expired-csrf:12345"
+    client._session_id = "stale-session"
+    client._base_origin = "https://yandex.ru"
+
+    mock_resp_page = MagicMock()
+    mock_resp_page.geturl.return_value = "https://yandex.ru/maps/org/test/12345/"
+    mock_resp_page.read.return_value = (
+        b'<html><script type="application/json">{"config":{"csrfToken":"fresh-csrf",'
+        b'"counters":{"analytics":{"sessionId":"fresh-session"}}}}</script></html>'
+    )
+    mock_resp_page.__enter__.return_value = mock_resp_page
+    mock_resp_page.__exit__.return_value = None
+
+    # Yandex returns HTTP 200 with {"csrfToken": "new-csrf"} on token expiration
+    mock_resp_expired_csrf = MagicMock()
+    mock_resp_expired_csrf.read.return_value = json.dumps(
+        {"csrfToken": "fresh-csrf:99999"}
+    ).encode("utf-8")
+    mock_resp_expired_csrf.__enter__.return_value = mock_resp_expired_csrf
+    mock_resp_expired_csrf.__exit__.return_value = None
+
+    valid_reviews_json = json.dumps(
+        {
+            "data": {
+                "reviews": [
+                    {
+                        "reviewId": "rev-fresh-1",
+                        "rating": 5,
+                        "author": {"name": "Fresh User"},
+                        "text": "Great place",
+                        "updatedTime": "2026-09-10T12:00:00Z",
+                    }
+                ]
+            }
+        }
+    ).encode("utf-8")
+    mock_resp_api = MagicMock()
+    mock_resp_api.read.return_value = valid_reviews_json
+    mock_resp_api.__enter__.return_value = mock_resp_api
+    mock_resp_api.__exit__.return_value = None
+
+    calls = []
+
+    def fake_open(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        calls.append(url)
+        if "fetchReviews" in url and len([c for c in calls if "fetchReviews" in c]) == 1:
+            return mock_resp_expired_csrf
+        if "fetchReviews" in url:
+            return mock_resp_api
+        return mock_resp_page
+
+    with patch.object(client, "_create_opener") as mock_create_opener:
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = fake_open
+        mock_create_opener.return_value = mock_opener
+        client._opener = mock_opener
+
+        status, items, err, code, *_ = await client.fetch_reviews(source)
+
+        assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+        assert len(items) == 1
+        assert items[0].external_review_id == "rev-fresh-1"
+        assert client._csrf_token == "fresh-csrf"
+        assert client._session_id == "fresh-session"
+        assert len(calls) == 3  # 1st fetchReviews (failed with csrfToken response), page visit, 2nd fetchReviews (success)
 
 
 @pytest.mark.asyncio
