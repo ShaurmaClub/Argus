@@ -64,8 +64,11 @@ class YandexReviewsClient:
         self._csrf_token = None
         self._session_id = None
         self._session_created_at = 0.0
-        self._opener = None
-        self._cookie_jar = None
+        if self._cookie_jar is not None:
+            try:
+                self._cookie_jar.clear()
+            except Exception:
+                pass
 
     @property
     def _last_rating(self) -> float | None:
@@ -241,7 +244,10 @@ class YandexReviewsClient:
     ) -> tuple[ReviewSyncStatus, list[ReviewItem], str | None, int | None, float | None, int | None]:
         # Step 1: Initialize session credentials if needed
         now_ts = time.time()
-        is_session_stale = (now_ts - self._session_created_at) > self._session_ttl_seconds
+        is_session_stale = (
+            self._session_created_at > 0.0
+            and (now_ts - self._session_created_at) > self._session_ttl_seconds
+        )
         if (
             not self._csrf_token
             or not self._session_id
@@ -299,10 +305,10 @@ class YandexReviewsClient:
                         or not isinstance(data.get("data"), dict)
                         or not isinstance(data["data"].get("reviews"), list)
                     ):
-                        if attempt == 0:
+                        is_csrf_refresh = isinstance(data, dict) and ("csrfToken" in data or "csrf" in data)
+                        if is_csrf_refresh and attempt == 0:
                             logger.info(
-                                "Yandex fetchReviews returned non-reviews schema (keys: %s), refreshing session before retry...",
-                                list(data.keys()) if isinstance(data, dict) else type(data),
+                                "Yandex fetchReviews returned expired csrfToken response, refreshing session before retry...",
                             )
                             self._reset_session()
                             init_status, err, http_code = self._initialize_session(source)
