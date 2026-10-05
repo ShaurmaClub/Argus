@@ -2940,3 +2940,106 @@ async def test_catchup_stops_at_historical_baseline_horizon(test_env):
         assert row["cnt"] == 10
 
 
+# ==============================================================================
+# 50. Open Doors Day: High-volume surge of 40 reviews handled without historical duplicates
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_open_doors_day_surge_up_to_40_reviews_handles_smoothly_without_historical_duplicates(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
+
+    # 1. Existing baseline: 20 historical reviews from early 2026
+    baseline_reviews = [
+        ReviewItem(
+            external_review_id=f"hist-base-{i}",
+            platform=ReviewPlatform.YANDEX,
+            branch_name=source.branch_name,
+            author_name=f"Historical Author {i}",
+            rating=5,
+            text=f"Historical text {i}",
+            published_at=f"2026-03-{10 + i:02d}T10:00:00Z",
+        )
+        for i in range(20)
+    ]
+    await bundle.reviews.save_reviews(baseline_reviews, source.id, mark_sent=True)
+
+    # 2. Open Doors Day burst: 40 brand new reviews published today
+    surge_reviews = [
+        ReviewItem(
+            external_review_id=f"surge-open-day-{i:02d}",
+            platform=ReviewPlatform.YANDEX,
+            branch_name=source.branch_name,
+            author_name=f"Guest {i}",
+            rating=5,
+            text=f"Amazing Open Doors Day review #{i}",
+            published_at=f"2026-10-05T{10 + (i // 4):02d}:{(i % 4) * 15:02d}:00Z",
+        )
+        for i in range(40)
+    ]
+    # Reverse so newest is first on pages (as Yandex/2GIS return them)
+    surge_newest_first = list(reversed(surge_reviews))
+
+    p1 = surge_newest_first[0:10]
+    p2 = surge_newest_first[10:20]
+    p3 = surge_newest_first[20:30]
+    p4 = surge_newest_first[30:40]
+    p5 = baseline_reviews[:10]  # Already known in SQLite
+
+    p6_called = False
+
+    async def mock_fetch_yandex(src, page=1, page_size=10):
+        nonlocal p6_called
+        if page == 1:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p1, None, 200, 5.0, 60
+        elif page == 2:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p2, None, 200, 5.0, 60
+        elif page == 3:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p3, None, 200, 5.0, 60
+        elif page == 4:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p4, None, 200, 5.0, 60
+        elif page == 5:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p5, None, 200, 5.0, 60
+        elif page >= 6:
+            p6_called = True
+            return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 60
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 60
+
+    test_env["yandex_client"].fetch_reviews = AsyncMock(side_effect=mock_fetch_yandex)
+
+    result = await service.sync_source(source)
+
+    # 1. Exactly 40 new reviews must be discovered
+    assert len(result.new_reviews) == 40
+    new_ids = {r.external_review_id for r in result.new_reviews}
+    expected_ids = {f"surge-open-day-{i:02d}" for i in range(40)}
+    assert new_ids == expected_ids
+
+    # 2. None of the baseline historical reviews leaked into new_reviews
+    assert not any(r.external_review_id.startswith("hist-base-") for r in result.new_reviews)
+
+    # 3. Catch-up stopped at Page 5 when seeing known baseline reviews (Page 6 never queried)
+    assert p6_called is False
+
+    # 4. Check DB: all 40 surge reviews are saved and pending delivery (is_sent_to_telegram = 0)
+    connection = bundle.database.require_connection()
+    async with connection.execute(
+        "SELECT COUNT(*) as cnt FROM reviews WHERE external_review_id LIKE 'surge-open-day-%' AND is_sent_to_telegram = 0"
+    ) as cur:
+        row = await cur.fetchone()
+        assert row["cnt"] == 40
+
+    # 5. Baseline historical reviews are untouched (is_sent_to_telegram = 1)
+    async with connection.execute(
+        "SELECT COUNT(*) as cnt FROM reviews WHERE external_review_id LIKE 'hist-base-%' AND is_sent_to_telegram = 1"
+    ) as cur:
+        row = await cur.fetchone()
+        assert row["cnt"] == 20
+
+
+

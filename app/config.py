@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     reviews_poll_interval_seconds: int = 900
     reviews_request_pause_seconds: float = 3.0
     reviews_fetch_page_size: int = 10
-    reviews_max_catchup_reviews: int = 50
+    reviews_max_catchup_reviews: int = 100
     reviews_error_alert_threshold: int = 3
     reviews_max_backoff_seconds: int = 7200
     alerts_reviews_enabled: bool = True
