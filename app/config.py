@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     enable_gemini_review_analysis: bool = False
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-3.5-flash-lite"
-    gemini_timeout_seconds: float = 15.0
+    gemini_timeout_seconds: float = 35.0
     gemini_max_rpm: int = 10
     gemini_max_retries: int = 3
     gemini_quota_cooldown_seconds: float = 3600.0
