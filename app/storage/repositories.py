@@ -7,6 +7,7 @@ except ImportError:
     UTC = timezone.utc  # noqa: UP017
 
 from app.analytics.dashboard import DashboardService
+from app.reviews.dates import parse_utc_datetime
 from app.reviews.models import ReviewItem, ReviewPlatform, ReviewSource
 from app.storage.database import Database
 from app.storage.models import (
@@ -1333,6 +1334,29 @@ class ReviewRepository:
         ) as cursor:
             row = await cursor.fetchone()
         return row is not None
+
+    async def get_oldest_review_published_at(self, source_id: int) -> str | None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """
+            SELECT published_at FROM reviews
+            WHERE source_id = ? AND published_at IS NOT NULL AND published_at != ''
+            """,
+            (source_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            return None
+        dts: list[tuple[datetime, str]] = []
+        for r in rows:
+            raw = str(r["published_at"])
+            dt = parse_utc_datetime(raw)
+            if dt is not None:
+                dts.append((dt, raw))
+        if not dts:
+            return None
+        dts.sort(key=lambda x: x[0])
+        return dts[0][1]
 
     async def save_reviews(
         self,

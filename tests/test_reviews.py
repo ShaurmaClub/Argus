@@ -2784,3 +2784,157 @@ def test_yandex_client_rejects_zero_rating():
     assert c_val == 50
 
 
+# ==============================================================================
+# 48. Historical reviews older than baseline do not trigger phantom alerts
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_unindexed_historical_reviews_do_not_trigger_phantom_alerts(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("2gis", "4504127908544789")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    # Seed baseline with reviews from September 2026
+    baseline_reviews = [
+        ReviewItem(
+            external_review_id=f"base-{i}",
+            platform=ReviewPlatform.DGIS,
+            branch_name=source.branch_name,
+            author_name=f"Base {i}",
+            rating=5,
+            text=f"Base text {i}",
+            published_at=f"2026-09-0{i}T10:00:00+03:00",
+        )
+        for i in range(1, 6)
+    ]
+    await bundle.reviews.save_reviews(baseline_reviews, source.id, mark_sent=True)
+
+    # Now a sync arrives with 1 genuine new review (today) + 1 resurrected historical review from 2025
+    real_new = ReviewItem(
+        external_review_id="real-new-1",
+        platform=ReviewPlatform.DGIS,
+        branch_name=source.branch_name,
+        author_name="Real New",
+        rating=5,
+        text="New positive review",
+        published_at="2026-10-05T12:00:00+03:00",
+    )
+    old_historical = ReviewItem(
+        external_review_id="old-hist-2025",
+        platform=ReviewPlatform.DGIS,
+        branch_name=source.branch_name,
+        author_name="Old Historical",
+        rating=5,
+        text="Old 2025 review not previously indexed",
+        published_at="2025-05-15T12:00:00+03:00",
+    )
+
+    async def mock_fetch(src, page=1, page_size=10):
+        return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, [real_new, old_historical] + baseline_reviews, None, 200, 5.0, 50
+
+    test_env["dgis_client"].fetch_reviews = AsyncMock(side_effect=mock_fetch)
+
+    result = await service.sync_source(source)
+
+    # ONLY the real new review must be reported as a new review!
+    assert len(result.new_reviews) == 1
+    assert result.new_reviews[0].external_review_id == "real-new-1"
+
+    # The historical review must be saved silently into database with mark_sent=True (is_sent_to_telegram = 1)
+    assert (await bundle.reviews.is_review_known("2gis", "old-hist-2025")) is True
+    connection = bundle.database.require_connection()
+    async with connection.execute(
+        "SELECT is_sent_to_telegram FROM reviews WHERE external_review_id = 'old-hist-2025'"
+    ) as cursor:
+        row = await cursor.fetchone()
+        assert row["is_sent_to_telegram"] == 1
+
+
+# ==============================================================================
+# 49. Catch-up terminates at historical baseline horizon without flooding alerts
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_catchup_stops_at_historical_baseline_horizon(test_env):
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("2gis", "4504127908544789")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    # Baseline from Sept 2026 (10 reviews)
+    baseline_reviews = [
+        ReviewItem(
+            external_review_id=f"base-item-{i}",
+            platform=ReviewPlatform.DGIS,
+            branch_name=source.branch_name,
+            author_name=f"Base {i}",
+            rating=5,
+            text=f"Base text {i}",
+            published_at=f"2026-09-{10 + i:02d}T10:00:00+03:00",
+        )
+        for i in range(10)
+    ]
+    await bundle.reviews.save_reviews(baseline_reviews, source.id, mark_sent=True)
+
+    # Page 1: 1 new review + 9 baseline reviews (full 10 items) -> triggers catchup
+    real_new = ReviewItem(
+        external_review_id="real-new-today",
+        platform=ReviewPlatform.DGIS,
+        branch_name=source.branch_name,
+        author_name="Real New Today",
+        rating=5,
+        text="Real new review",
+        published_at="2026-10-05T12:00:00+03:00",
+    )
+    p1_items = [real_new] + baseline_reviews[:9]
+
+    # Page 2: Contains 10 historical reviews from 2025 that were never in SQLite
+    p2_items = [
+        ReviewItem(
+            external_review_id=f"old-2025-{i}",
+            platform=ReviewPlatform.DGIS,
+            branch_name=source.branch_name,
+            author_name=f"Old {i}",
+            rating=5,
+            text=f"Old text {i}",
+            published_at=f"2025-08-{10 + i:02d}T10:00:00+03:00",
+        )
+        for i in range(10)
+    ]
+
+    p3_called = False
+
+    async def mock_fetch(src, page=1, page_size=10):
+        nonlocal p3_called
+        if page == 1:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p1_items, None, 200, 5.0, 50
+        elif page == 2:
+            return ReviewSyncStatus.SUCCESS_NEW_REVIEWS, p2_items, None, 200, 5.0, 50
+        elif page == 3:
+            p3_called = True
+            return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 50
+        return ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 50
+
+    test_env["dgis_client"].fetch_reviews = AsyncMock(side_effect=mock_fetch)
+
+    result = await service.sync_source(source)
+
+    # ONLY 1 real review must be in new_reviews
+    assert len(result.new_reviews) == 1
+    assert result.new_reviews[0].external_review_id == "real-new-today"
+
+    # Catchup must NOT call page 3
+    assert p3_called is False
+
+    # All 2025 reviews on page 2 must be silently saved with is_sent_to_telegram=1
+    connection = bundle.database.require_connection()
+    async with connection.execute(
+        "SELECT COUNT(*) as cnt FROM reviews WHERE external_review_id LIKE 'old-2025-%' AND is_sent_to_telegram = 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+        assert row["cnt"] == 10
+
+

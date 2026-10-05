@@ -13,6 +13,7 @@ from app.config import Settings
 from app.reviews.analyzer import GeminiReviewWorker
 from app.reviews.client_2gis import DGisReviewsClient
 from app.reviews.client_yandex import YandexReviewsClient
+from app.reviews.dates import parse_utc_datetime
 from app.reviews.models import (
     DEFAULT_SOURCES,
     ReviewItem,
@@ -408,7 +409,15 @@ class ReviewsService:
             )
 
         # Handle Deduplication & New Reviews
+        oldest_ts = (
+            await self.repository.get_oldest_review_published_at(source.id)
+            if source.is_initialized
+            else None
+        )
+        oldest_known_dt = parse_utc_datetime(oldest_ts) if oldest_ts else None
+
         new_items: list[ReviewItem] = []
+        historical_items: list[ReviewItem] = []
         seen_ids: set[str] = set()
         for it in items:
             rev_id = str(it.external_review_id)
@@ -416,8 +425,22 @@ class ReviewsService:
                 continue
             is_known = await self.repository.is_review_known(it.platform, rev_id)
             if not is_known:
-                new_items.append(it)
-                seen_ids.add(rev_id)
+                it_dt = parse_utc_datetime(it.published_at)
+                if oldest_known_dt is not None and it_dt is not None and it_dt < oldest_known_dt:
+                    logger.info(
+                        "Review %s for %s (%s) is older than historical baseline (%s < %s). "
+                        "Marking as known historical review without alerting.",
+                        rev_id,
+                        source.branch_name,
+                        source.platform,
+                        it.published_at,
+                        oldest_ts,
+                    )
+                    historical_items.append(it)
+                    seen_ids.add(rev_id)
+                else:
+                    new_items.append(it)
+                    seen_ids.add(rev_id)
 
         # Catch-up during downtime
         # If page 1 had >=1 new review AND page 1 was full,
@@ -429,6 +452,7 @@ class ReviewsService:
         ):
             current_page = 2
             total_fetched = len(items)
+            hit_historical_horizon = False
             while total_fetched < config.max_catchup_reviews:
                 if config.request_pause_seconds > 0:
                     await asyncio.sleep(config.request_pause_seconds)
@@ -481,19 +505,45 @@ class ReviewsService:
                     break
 
                 page_new_count = 0
-                for it in c_items:
+                for idx, it in enumerate(c_items):
                     rev_id = str(it.external_review_id)
                     if rev_id in seen_ids:
                         continue
                     is_known = await self.repository.is_review_known(
                         it.platform, rev_id
                     )
-                    if not is_known:
-                        new_items.append(it)
+                    if is_known:
+                        continue
+
+                    it_dt = parse_utc_datetime(it.published_at)
+                    if oldest_known_dt is not None and it_dt is not None and it_dt < oldest_known_dt:
+                        logger.info(
+                            "Catch-up reached historical review %s for %s (%s) (%s < %s). "
+                            "Saving remaining page silently and terminating catch-up.",
+                            rev_id,
+                            source.branch_name,
+                            source.platform,
+                            it.published_at,
+                            oldest_ts,
+                        )
+                        historical_items.append(it)
                         seen_ids.add(rev_id)
-                        page_new_count += 1
+                        hit_historical_horizon = True
+                        for rest_it in c_items[idx + 1:]:
+                            rest_id = str(rest_it.external_review_id)
+                            if rest_id not in seen_ids:
+                                historical_items.append(rest_it)
+                                seen_ids.add(rest_id)
+                        break
+
+                    new_items.append(it)
+                    seen_ids.add(rev_id)
+                    page_new_count += 1
 
                 total_fetched += len(c_items)
+
+                if hit_historical_horizon:
+                    break
 
                 # Stop if this page had zero new reviews (all known)
                 if page_new_count == 0:
@@ -504,6 +554,10 @@ class ReviewsService:
                     break
 
                 current_page += 1
+
+        # Silently persist any unindexed historical reviews (mark_sent=True)
+        if historical_items:
+            await self.repository.save_reviews(historical_items, source.id, mark_sent=True)
 
         # Sort new reviews chronologically: OLDEST to NEWEST
         new_items.sort(key=lambda r: r.published_at)
