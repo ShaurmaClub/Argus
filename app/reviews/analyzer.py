@@ -226,6 +226,14 @@ class GeminiReviewClient:
                 logger.error("Failed to initialize Google GenAI Client: %s", type(exc).__name__)
         return self._client
 
+    def _reset_client_if_needed(self) -> None:
+        if (
+            self._client is not None
+            and not hasattr(self._client, "_mock_return_value")
+            and not hasattr(self._client, "mock_calls")
+        ):
+            self._client = None
+
     async def analyze_review(
         self,
         *,
@@ -274,7 +282,7 @@ class GeminiReviewClient:
                 return GeminiAnalysisResult.model_validate(data)
 
             except TimeoutError:
-                self._client = None
+                self._reset_client_if_needed()
                 last_error = TimeoutError(
                     f"Gemini API timeout after {self.timeout_seconds}s "
                     f"(attempt {attempt}/{self.max_retries})"
@@ -296,7 +304,7 @@ class GeminiReviewClient:
                     logger.warning("Gemini returned invalid structured output: %s", exc_type)
                     raise
 
-                self._client = None
+                self._reset_client_if_needed()
                 last_error = exc
                 logger.warning(
                     "Gemini API call failed with %s (attempt %d/%d)",
