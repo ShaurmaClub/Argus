@@ -2796,6 +2796,7 @@ async def test_unindexed_historical_reviews_do_not_trigger_phantom_alerts(test_e
     source = await bundle.reviews.get_source_by_external_id("2gis", "4504127908544789")
 
     await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
     # Seed baseline with reviews from September 2026
     baseline_reviews = [
         ReviewItem(
@@ -2864,6 +2865,7 @@ async def test_catchup_stops_at_historical_baseline_horizon(test_env):
     source = await bundle.reviews.get_source_by_external_id("2gis", "4504127908544789")
 
     await bundle.reviews.mark_source_initialized(source.id)
+    source = await bundle.reviews.get_source_by_id(source.id)
     # Baseline from Sept 2026 (10 reviews)
     baseline_reviews = [
         ReviewItem(
