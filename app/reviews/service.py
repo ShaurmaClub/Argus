@@ -728,6 +728,19 @@ class ReviewsService:
             if config.alerts_enabled:
                 await self.deliver_pending_reviews()
 
+            # Re-enqueue any unanalyzed reviews for AI processing
+            runtime_ai = await self.runtime_settings.get_bool(
+                "enable_gemini_review_analysis",
+                self.settings.enable_gemini_review_analysis,
+            )
+            if runtime_ai:
+                await self.ensure_ai_worker_started()
+                worker = self.get_ai_worker()
+                unprocessed = await self.repository.get_pending_ai_reviews(limit=20)
+                for unproc in unprocessed:
+                    if unproc.id is not None:
+                        worker.enqueue(unproc.id)
+
             await self.ensure_default_sources()
             sources = await self.repository.list_sources(only_active=True)
             results: list[ReviewSyncResult] = []

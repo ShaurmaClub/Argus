@@ -215,9 +215,12 @@ class GeminiReviewClient:
                 return None
             try:
                 from google import genai
+                from google.genai import types
+
                 ambient_google_key = os.environ.pop("GOOGLE_API_KEY", None)
                 try:
-                    self._client = genai.Client(api_key=self._api_key)
+                    http_opts = types.HttpOptions(timeout=int(self.timeout_seconds * 1000))
+                    self._client = genai.Client(api_key=self._api_key, http_options=http_opts)
                 finally:
                     if ambient_google_key is not None:
                         os.environ["GOOGLE_API_KEY"] = ambient_google_key
@@ -226,13 +229,20 @@ class GeminiReviewClient:
                 logger.error("Failed to initialize Google GenAI Client: %s", type(exc).__name__)
         return self._client
 
-    def _reset_client_if_needed(self) -> None:
+    async def _reset_client_if_needed(self) -> None:
         if (
             self._client is not None
             and not hasattr(self._client, "_mock_return_value")
             and not hasattr(self._client, "mock_calls")
         ):
+            client = self._client
             self._client = None
+            try:
+                if hasattr(client, "_api_client") and hasattr(client._api_client, "aclose"):
+                    await client._api_client.aclose()
+            except Exception:
+                pass
+
 
     async def analyze_review(
         self,
@@ -281,8 +291,8 @@ class GeminiReviewClient:
                 data = json.loads(response.text)
                 return GeminiAnalysisResult.model_validate(data)
 
-            except TimeoutError:
-                self._reset_client_if_needed()
+            except (TimeoutError, asyncio.TimeoutError):
+                await self._reset_client_if_needed()
                 last_error = TimeoutError(
                     f"Gemini API timeout after {self.timeout_seconds}s "
                     f"(attempt {attempt}/{self.max_retries})"
@@ -304,7 +314,7 @@ class GeminiReviewClient:
                     logger.warning("Gemini returned invalid structured output: %s", exc_type)
                     raise
 
-                self._reset_client_if_needed()
+                await self._reset_client_if_needed()
                 last_error = exc
                 logger.warning(
                     "Gemini API call failed with %s (attempt %d/%d)",

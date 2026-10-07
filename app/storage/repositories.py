@@ -1630,7 +1630,7 @@ class ReviewRepository:
             FROM reviews r
             JOIN review_sources s ON r.source_id = s.id
             JOIN review_ai_analyses a ON r.id = a.review_id
-            WHERE a.status = 'PENDING'
+            WHERE a.status = 'PENDING' OR (a.status = 'AI_ERROR' AND a.retry_count < 3)
             ORDER BY r.published_at ASC, r.id ASC
             LIMIT ?
             """,
