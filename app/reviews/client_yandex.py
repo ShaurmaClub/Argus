@@ -57,6 +57,7 @@ class YandexReviewsClient:
         self._branch_ratings: dict[str, float] = {}
         self._branch_counts: dict[str, int] = {}
         self._ratings_updated_at: dict[str, float] = {}
+        self._cached_html_reviews: dict[str, list[dict]] = {}
         self._session_created_at: float = 0.0
         self._session_ttl_seconds: float = 14400.0  # 4 hours proactive refresh
 
@@ -219,6 +220,19 @@ class YandexReviewsClient:
                 if count > 0 or prev_c is None or prev_c == 0:
                     self._branch_counts[source.external_id] = count
 
+            # Cache any reviews embedded directly in page HTML
+            try:
+                stack = page_data.get("stack", [])
+                if isinstance(stack, list) and len(stack) > 0 and isinstance(stack[0], dict):
+                    results = stack[0].get("results", {}) if isinstance(stack[0], dict) else {}
+                    items = results.get("items", []) if isinstance(results, dict) else []
+                    if isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict):
+                        rr = items[0].get("reviewResults", {})
+                        if isinstance(rr, dict) and "reviews" in rr and isinstance(rr["reviews"], list) and len(rr["reviews"]) > 0:
+                            self._cached_html_reviews[source.external_id] = rr["reviews"]
+            except Exception:
+                pass
+
             if not self._csrf_token or not self._session_id:
                 return ReviewSyncStatus.PARSER_FORMAT_CHANGED, "Missing csrfToken or sessionId", 200
 
@@ -267,13 +281,14 @@ class YandexReviewsClient:
                     self._branch_counts.get(source.external_id),
                 )
 
-        # Step 2: Call fetchReviews endpoint (max 1 retry after real session refresh)
-        for attempt in range(2):
+        # Step 2: Call fetchReviews endpoint (with retries for transient upstream 500 errors)
+        max_attempts = 4
+        for attempt in range(max_attempts):
             api_params = {
                 "ajax": "1",
                 "businessId": source.external_id,
                 "csrfToken": self._csrf_token,
-                "locale": self._locale,
+                "locale": self._locale or "ru_RU",
                 "page": str(page),
                 "pageSize": str(page_size),
                 "ranking": "by_time",
@@ -315,24 +330,61 @@ class YandexReviewsClient:
                             if init_status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
                                 continue
 
-                        return (
-                            ReviewSyncStatus.PARSER_FORMAT_CHANGED,
-                            [],
-                            "Invalid response schema: expected data.reviews list",
-                            200,
-                            self._branch_ratings.get(source.external_id),
-                            self._branch_counts.get(source.external_id),
-                        )
-                    reviews_data = data["data"]["reviews"]
-                    params_dict = data["data"].get("params", {})
-                    if isinstance(params_dict, dict) and "count" in params_dict:
-                        try:
-                            new_cnt = int(params_dict["count"])
-                            prev_c = self._branch_counts.get(source.external_id)
-                            if new_cnt > 0 or prev_c is None or prev_c == 0:
-                                self._branch_counts[source.external_id] = new_cnt
-                        except (ValueError, TypeError):
-                            pass
+                        is_api_error = isinstance(data, dict) and "error" in data
+                        if is_api_error:
+                            err_info = data.get("error", {})
+                            err_code = err_info.get("code") if isinstance(err_info, dict) else None
+                            err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
+                            if attempt < max_attempts - 1:
+                                logger.info(
+                                    "Yandex fetchReviews returned upstream error %s (%s) for %s, retrying attempt %d/%d...",
+                                    err_code,
+                                    err_msg,
+                                    source.branch_name,
+                                    attempt + 1,
+                                    max_attempts,
+                                )
+                                time.sleep(1.0 * (attempt + 1))
+                                continue
+
+                            # Fallback to reviews embedded in initial HTML if available
+                            if page == 1 and source.external_id in self._cached_html_reviews and self._cached_html_reviews[source.external_id]:
+                                logger.info(
+                                    "Yandex fetchReviews failed with %s for %s, falling back to %d reviews embedded in page HTML",
+                                    err_code,
+                                    source.branch_name,
+                                    len(self._cached_html_reviews[source.external_id]),
+                                )
+                                reviews_data = self._cached_html_reviews[source.external_id]
+                            else:
+                                return (
+                                    ReviewSyncStatus.HTTP_ERROR,
+                                    [],
+                                    f"Yandex API error {err_code}: {err_msg}",
+                                    500 if err_code == 500 else 200,
+                                    self._branch_ratings.get(source.external_id),
+                                    self._branch_counts.get(source.external_id),
+                                )
+                        else:
+                            return (
+                                ReviewSyncStatus.PARSER_FORMAT_CHANGED,
+                                [],
+                                "Invalid response schema: expected data.reviews list",
+                                200,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
+                            )
+                    else:
+                        reviews_data = data["data"]["reviews"]
+                        params_dict = data["data"].get("params", {})
+                        if isinstance(params_dict, dict) and "count" in params_dict:
+                            try:
+                                new_cnt = int(params_dict["count"])
+                                prev_c = self._branch_counts.get(source.external_id)
+                                if new_cnt > 0 or prev_c is None or prev_c == 0:
+                                    self._branch_counts[source.external_id] = new_cnt
+                            except (ValueError, TypeError):
+                                pass
 
                     # Ensure we have branch rating for this specific source
                     now_ts = time.time()
@@ -444,6 +496,16 @@ class YandexReviewsClient:
                     )
 
             except urllib.error.HTTPError as exc:
+                if exc.code in (500, 502, 503, 504) and attempt < max_attempts - 1:
+                    logger.info(
+                        "Yandex fetchReviews returned HTTP %d for %s, retrying attempt %d/%d...",
+                        exc.code,
+                        source.branch_name,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
                 if exc.code in (401, 403) and attempt == 0:
                     logger.info(
                         "Yandex fetchReviews returned %d, refreshing session before retry...",
