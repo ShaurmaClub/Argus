@@ -516,6 +516,27 @@ class AlertService:
 
         return parts
 
+    def _review_is_silent(self, review: Any, ai_analysis: Any | None) -> bool:
+        """Positive reviews are delivered without a push notification.
+
+        Silent only when the AI analysis succeeded and the verdict is GREEN and the
+        star rating is exactly 5. Anything uncertain (no analysis, failed
+        analysis, YELLOW, RED, low rating) stays loud, so nothing important is muted.
+        """
+        if not getattr(self.settings, "reviews_silent_green", True):
+            return False
+        if ai_analysis is None:
+            return False
+        if getattr(ai_analysis, "status", None) != "SUCCESS":
+            return False
+        if str(getattr(ai_analysis, "verdict", "")).upper() != "GREEN":
+            return False
+        rating = getattr(review, "rating", None)
+        # Only a clean 5-star review is muted; 4 stars and below always notify.
+        if not isinstance(rating, (int, float)) or rating < 5:
+            return False
+        return True
+
     async def send_review_alert(
         self,
         review: Any,
@@ -552,6 +573,7 @@ class AlertService:
             chunks = self._render_review_parts(review, source, ai_analysis=ai_analysis)
             total_parts = len(chunks)
             targets = self._alert_targets()
+            silent = self._review_is_silent(review, ai_analysis)
 
             if not targets:
                 logger.warning("No alert targets configured for review alerts delivery")
@@ -608,6 +630,7 @@ class AlertService:
                             chat_id=chat_id,
                             text=chunk_text,
                             disable_web_page_preview=True,
+                            disable_notification=silent,
                         )
                         target_progress[chat_str] = part_idx + 1
                         min_parts_sent = min(

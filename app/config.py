@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     reviews_error_alert_threshold: int = 3
     reviews_max_backoff_seconds: int = 7200
     alerts_reviews_enabled: bool = True
+    reviews_silent_green: bool = True
 
     enable_gemini_review_analysis: bool = False
     gemini_api_key: SecretStr | None = None
