@@ -57,7 +57,6 @@ class YandexReviewsClient:
         self._branch_ratings: dict[str, float] = {}
         self._branch_counts: dict[str, int] = {}
         self._ratings_updated_at: dict[str, float] = {}
-        self._cached_html_reviews: dict[str, list[dict]] = {}
         self._session_created_at: float = 0.0
         self._session_ttl_seconds: float = 14400.0  # 4 hours proactive refresh
 
@@ -220,19 +219,6 @@ class YandexReviewsClient:
                 if count > 0 or prev_c is None or prev_c == 0:
                     self._branch_counts[source.external_id] = count
 
-            # Cache any reviews embedded directly in page HTML
-            try:
-                stack = page_data.get("stack", [])
-                if isinstance(stack, list) and len(stack) > 0 and isinstance(stack[0], dict):
-                    results = stack[0].get("results", {}) if isinstance(stack[0], dict) else {}
-                    items = results.get("items", []) if isinstance(results, dict) else []
-                    if isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict):
-                        rr = items[0].get("reviewResults", {})
-                        if isinstance(rr, dict) and "reviews" in rr and isinstance(rr["reviews"], list) and len(rr["reviews"]) > 0:
-                            self._cached_html_reviews[source.external_id] = rr["reviews"]
-            except Exception:
-                pass
-
             if not self._csrf_token or not self._session_id:
                 return ReviewSyncStatus.PARSER_FORMAT_CHANGED, "Missing csrfToken or sessionId", 200
 
@@ -255,7 +241,9 @@ class YandexReviewsClient:
         source: ReviewSource,
         page: int = 1,
         page_size: int = 10,
-    ) -> tuple[ReviewSyncStatus, list[ReviewItem], str | None, int | None, float | None, int | None]:
+    ) -> tuple[
+        ReviewSyncStatus, list[ReviewItem], str | None, int | None, float | None, int | None
+    ]:
         # Step 1: Initialize session credentials if needed
         now_ts = time.time()
         is_session_stale = (
@@ -283,6 +271,7 @@ class YandexReviewsClient:
 
         # Step 2: Call fetchReviews endpoint (with retries for transient upstream 500 errors)
         max_attempts = 4
+        session_refreshed = False
         for attempt in range(max_attempts):
             api_params = {
                 "ajax": "1",
@@ -320,51 +309,53 @@ class YandexReviewsClient:
                         or not isinstance(data.get("data"), dict)
                         or not isinstance(data["data"].get("reviews"), list)
                     ):
-                        is_csrf_refresh = isinstance(data, dict) and ("csrfToken" in data or "csrf" in data)
-                        if is_csrf_refresh and attempt == 0:
-                            logger.info(
-                                "Yandex fetchReviews returned expired csrfToken response, refreshing session before retry...",
+                        is_csrf_refresh = isinstance(data, dict) and (
+                            "csrfToken" in data or "csrf" in data
+                        )
+                        err_info = data.get("error") if isinstance(data, dict) else None
+                        try:
+                            err_code = (
+                                int(err_info.get("code")) if isinstance(err_info, dict) else None
                             )
+                        except (TypeError, ValueError):
+                            err_code = None
+                        if (
+                            (is_csrf_refresh or err_code in (401, 403))
+                            and not session_refreshed
+                            and attempt < max_attempts - 1
+                        ):
+                            session_refreshed = True
                             self._reset_session()
                             init_status, err, http_code = self._initialize_session(source)
                             if init_status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS:
                                 continue
+                            return (
+                                init_status, [], f"Session refresh failed: {err}", http_code,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
+                            )
 
-                        is_api_error = isinstance(data, dict) and "error" in data
-                        if is_api_error:
-                            err_info = data.get("error", {})
-                            err_code = err_info.get("code") if isinstance(err_info, dict) else None
-                            err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
-                            if attempt < max_attempts - 1:
+                        if isinstance(data, dict) and "error" in data:
+                            if err_code in (500, 502, 503, 504) and attempt < max_attempts - 1:
                                 logger.info(
-                                    "Yandex fetchReviews returned upstream error %s (%s) for %s, retrying attempt %d/%d...",
-                                    err_code,
-                                    err_msg,
-                                    source.branch_name,
-                                    attempt + 1,
-                                    max_attempts,
+                                    "Yandex upstream error %s for %s; retry %d/%d",
+                                    err_code, source.branch_name, attempt + 1, max_attempts,
                                 )
-                                time.sleep(1.0 * (attempt + 1))
+                                time.sleep(2.0 ** attempt)
                                 continue
-
-                            # Fallback to reviews embedded in initial HTML if available
-                            if page == 1 and source.external_id in self._cached_html_reviews and self._cached_html_reviews[source.external_id]:
-                                logger.info(
-                                    "Yandex fetchReviews failed with %s for %s, falling back to %d reviews embedded in page HTML",
-                                    err_code,
-                                    source.branch_name,
-                                    len(self._cached_html_reviews[source.external_id]),
-                                )
-                                reviews_data = self._cached_html_reviews[source.external_id]
-                            else:
-                                return (
-                                    ReviewSyncStatus.HTTP_ERROR,
-                                    [],
-                                    f"Yandex API error {err_code}: {err_msg}",
-                                    500 if err_code == 500 else 200,
-                                    self._branch_ratings.get(source.external_id),
-                                    self._branch_counts.get(source.external_id),
-                                )
+                            # HTML snapshots are neither fresh nor guaranteed to be sorted
+                            # by time. Never let one advance the pagination/health state.
+                            failure = ReviewSyncStatus.HTTP_ERROR
+                            if err_code == 429:
+                                failure = ReviewSyncStatus.RATE_LIMITED
+                            elif err_code in (401, 403):
+                                failure = ReviewSyncStatus.SOURCE_BLOCKED
+                            return (
+                                failure, [], f"Yandex API error {err_code}",
+                                err_code if err_code is not None else 200,
+                                self._branch_ratings.get(source.external_id),
+                                self._branch_counts.get(source.external_id),
+                            )
                         else:
                             return (
                                 ReviewSyncStatus.PARSER_FORMAT_CHANGED,
@@ -504,9 +495,14 @@ class YandexReviewsClient:
                         attempt + 1,
                         max_attempts,
                     )
-                    time.sleep(1.0 * (attempt + 1))
+                    time.sleep(2.0 ** attempt)
                     continue
-                if exc.code in (401, 403) and attempt == 0:
+                if (
+                    exc.code in (401, 403)
+                    and not session_refreshed
+                    and attempt < max_attempts - 1
+                ):
+                    session_refreshed = True
                     logger.info(
                         "Yandex fetchReviews returned %d, refreshing session before retry...",
                         exc.code,

@@ -193,6 +193,29 @@ class ReviewsService:
             latency_ms=latency_ms,
         )
 
+    async def _notify_recovery(self, source: ReviewSource) -> int:
+        # Handle successful fetch: send recovery alert if coming from degraded state
+        health_alert_active = source.health_alert_active
+        if source.health_alert_active == 1:
+            logger.info(
+                "Source %s (%s) recovered after degraded state. Dispatching recovery alert.",
+                source.branch_name,
+                source.platform,
+            )
+            try:
+                sent = await self.alerts.send_review_recovery_alert(source=source)
+                if sent:
+                    health_alert_active = 0
+                else:
+                    logger.warning(
+                        "Review recovery alert delivery failed, "
+                        "preserving active state to retry next cycle"
+                    )
+            except Exception as alert_exc:
+                logger.error("Failed to send review recovery alert: %s", alert_exc)
+
+        return health_alert_active
+
     async def sync_source(self, source: ReviewSource) -> ReviewSyncResult:
         now_dt = datetime.now(UTC)
         now_iso = now_dt.isoformat()
@@ -286,26 +309,6 @@ class ReviewsService:
                 source, status, err, http_code, now_dt, now_iso, t_start, config
             )
 
-        # Handle successful fetch: send recovery alert if coming from degraded state
-        health_alert_active = source.health_alert_active
-        if source.health_alert_active == 1:
-            logger.info(
-                "Source %s (%s) recovered after degraded state. Dispatching recovery alert.",
-                source.branch_name,
-                source.platform,
-            )
-            try:
-                sent = await self.alerts.send_review_recovery_alert(source=source)
-                if sent:
-                    health_alert_active = 0
-                else:
-                    logger.warning(
-                        "Review recovery alert delivery failed, "
-                        "preserving active state to retry next cycle"
-                    )
-            except Exception as alert_exc:
-                logger.error("Failed to send review recovery alert: %s", alert_exc)
-
         # Handle Cold Start Baseline
         if not source.is_initialized:
             baseline_items = list(items)
@@ -387,6 +390,7 @@ class ReviewsService:
                 if (branch_rating is not None and 1.0 <= branch_rating <= 5.0)
                 else None
             )
+            health_alert_active = await self._notify_recovery(source)
             await self.repository.update_source_status(
                 source.id,
                 status="SUCCESS",
@@ -441,6 +445,8 @@ class ReviewsService:
                 else:
                     new_items.append(it)
                     seen_ids.add(rev_id)
+
+        catchup_incomplete = len(new_items) > 0 and len(items) == config.fetch_page_size
 
         # Catch-up during downtime
         # If page 1 had >=1 new review AND page 1 was full,
@@ -502,6 +508,7 @@ class ReviewsService:
                     )
 
                 if not c_items:
+                    catchup_incomplete = False
                     break
 
                 page_new_count = 0
@@ -516,7 +523,11 @@ class ReviewsService:
                         continue
 
                     it_dt = parse_utc_datetime(it.published_at)
-                    if oldest_known_dt is not None and it_dt is not None and it_dt < oldest_known_dt:
+                    if (
+                        oldest_known_dt is not None
+                        and it_dt is not None
+                        and it_dt < oldest_known_dt
+                    ):
                         logger.info(
                             "Catch-up reached historical review %s for %s (%s) (%s < %s). "
                             "Saving remaining page silently and terminating catch-up.",
@@ -543,17 +554,29 @@ class ReviewsService:
                 total_fetched += len(c_items)
 
                 if hit_historical_horizon:
+                    catchup_incomplete = False
                     break
 
                 # Stop if this page had zero new reviews (all known)
                 if page_new_count == 0:
+                    catchup_incomplete = False
                     break
 
                 # Stop if end of stream reached (less than full page returned)
                 if len(c_items) < config.fetch_page_size:
+                    catchup_incomplete = False
                     break
 
                 current_page += 1
+
+        if catchup_incomplete:
+            return await self._handle_sync_failure(
+                source, ReviewSyncStatus.UNKNOWN_ERROR,
+                "Catch-up limit reached before the known review boundary; "
+                "increase REVIEWS_MAX_CATCHUP_REVIEWS and retry. "
+                "No new reviews were marked as known.",
+                http_code, now_dt, now_iso, t_start, config,
+            )
 
         # Silently persist any unindexed historical reviews (mark_sent=True)
         if historical_items:
@@ -638,6 +661,7 @@ class ReviewsService:
             else source.total_reviews_count
         )
 
+        health_alert_active = await self._notify_recovery(source)
         await self.repository.update_source_status(
             source.id,
             status=status.value if hasattr(status, "value") else str(status),

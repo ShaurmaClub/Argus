@@ -533,7 +533,7 @@ class AlertService:
             return False
         rating = getattr(review, "rating", None)
         # Only a clean 5-star review is muted; 4 stars and below always notify.
-        if not isinstance(rating, (int, float)) or rating < 5:
+        if not isinstance(rating, (int, float)) or rating != 5:
             return False
         return True
 

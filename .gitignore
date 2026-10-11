@@ -24,3 +24,6 @@ sessions/
 *.env
 secrets/
 secrets/*.env
+*.egg-info/
+*.bak
+*.bak_*
