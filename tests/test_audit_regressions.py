@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.reviews.client_yandex import YandexReviewsClient
-from app.reviews.models import DEFAULT_SOURCES, ReviewItem, ReviewSource, ReviewSyncStatus
+from app.reviews.models import (
+    DEFAULT_SOURCES,
+    ReviewItem,
+    ReviewPlatform,
+    ReviewSource,
+    ReviewSyncStatus,
+)
 from tests.test_reviews import test_env  # noqa: F401
 
 
@@ -206,3 +212,64 @@ async def test_real_delivery_preserves_silent_policy(test_env, rating, verdict, 
     )
     assert await service.deliver_pending_reviews() == 1
     assert test_env["bot"].sent_messages[-1]["disable_notification"] is silent
+
+
+def test_2gis_page_metadata_parser():
+    from app.reviews.client_2gis import DGisReviewsClient
+
+    sample_html = (
+        '{"reviews":{"general_rating":4.8,"general_review_count":53,'
+        '"general_review_count_with_stars":69,"org_rating":4.9}}'
+    )
+    rating, count = DGisReviewsClient._parse_page_metadata(sample_html)
+    assert rating == 4.8
+    assert count == 69
+
+
+def test_2gis_page_metadata_parser_fallback():
+    from app.reviews.client_2gis import DGisReviewsClient
+
+    html_fallback = '<meta property="og:description" content="Оценка 4.8, 16 фото, 53 отзыва." />'
+    rating, count = DGisReviewsClient._parse_page_metadata(html_fallback)
+    assert rating == 4.8
+    assert count == 53
+
+
+@pytest.mark.asyncio
+async def test_2gis_prefers_page_rating_over_microservice_meta():
+    from app.reviews.client_2gis import DGisReviewsClient
+
+    client = DGisReviewsClient()
+    source = ReviewSource(
+        id=1,
+        platform=ReviewPlatform.DGIS,
+        branch_name="УО Датахаб",
+        external_id="4504127908536611",
+        url="https://2gis.ru/moscow/firm/4504127908536611/tab/reviews",
+    )
+
+    # Pre-populate page metadata with 4.8 / 69
+    client._branch_ratings[source.external_id] = 4.8
+    client._branch_counts[source.external_id] = 69
+    client._ratings_updated_at[source.external_id] = time.time()
+
+    # API returns 4.9 in meta
+    api_data = {
+        "reviews": [],
+        "meta": {"branch_rating": 4.9, "total_count": 56},
+    }
+
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value=api_data)
+
+    mock_session = MagicMock()
+    mock_session.closed = False
+    mock_session.get.return_value.__aenter__.return_value = mock_resp
+    client._session = mock_session
+
+    status, items, err, code, rating, count = await client.fetch_reviews(source)
+    assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+    assert rating == 4.8
+    assert count == 69
+

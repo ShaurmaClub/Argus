@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 import urllib.parse
 
 import aiohttp
@@ -31,6 +32,9 @@ class DGisReviewsClient:
         self._user_agent = user_agent
         self._api_key = api_key
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._branch_ratings: dict[str, float] = {}
+        self._branch_counts: dict[str, int] = {}
+        self._ratings_updated_at: dict[str, float] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -43,6 +47,91 @@ class DGisReviewsClient:
     async def close(self) -> None:
         if not self._external_session and self._session is not None and not self._session.closed:
             await self._session.close()
+
+    @staticmethod
+    def _parse_page_metadata(html: str) -> tuple[float | None, int | None]:
+        rating: float | None = None
+        count: int | None = None
+
+        # 1. Rating: "general_rating" in JSON state of 2GIS web page
+        m_rating = re.search(r'"general_rating"\s*:\s*([0-9.]+)', html)
+        if m_rating:
+            try:
+                r_val = round(float(m_rating.group(1)), 1)
+                if 1.0 <= r_val <= 5.0:
+                    rating = r_val
+            except (ValueError, TypeError):
+                pass
+
+        # Fallback for rating: og:description ("Оценка 4.8...") or HTML tags
+        if rating is None:
+            m_og = re.search(r'Оценка\s+([0-9.]+)', html)
+            if m_og:
+                try:
+                    r_val = round(float(m_og.group(1)), 1)
+                    if 1.0 <= r_val <= 5.0:
+                        rating = r_val
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Count: "general_review_count_with_stars" (matches visible "69 оценок")
+        m_stars = re.search(r'"general_review_count_with_stars"\s*:\s*([0-9]+)', html)
+        if m_stars:
+            try:
+                c_val = int(m_stars.group(1))
+                if c_val >= 0:
+                    count = c_val
+            except (ValueError, TypeError):
+                pass
+
+        if count is None:
+            m_reviews = re.search(r'"general_review_count"\s*:\s*([0-9]+)', html)
+            if m_reviews:
+                try:
+                    c_val = int(m_reviews.group(1))
+                    if c_val >= 0:
+                        count = c_val
+                except (ValueError, TypeError):
+                    pass
+
+        if count is None:
+            m_cnt_txt = re.search(r'([0-9]+)\s+(?:оценок|отзыв)', html)
+            if m_cnt_txt:
+                try:
+                    c_val = int(m_cnt_txt.group(1))
+                    if c_val >= 0:
+                        count = c_val
+                except (ValueError, TypeError):
+                    pass
+
+        return rating, count
+
+    async def _fetch_branch_metadata(
+        self, source: ReviewSource
+    ) -> tuple[float | None, int | None]:
+        session = await self._get_session()
+        try:
+            headers = {
+                "Cookie": "dg5_museum_accept=true",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+            async with session.get(source.url, headers=headers) as resp:
+                if resp.status == 200:
+                    html = await resp.text(errors="replace")
+                    match_key = re.search(r'["\']reviewApiKey["\']\s*:\s*["\']([a-f0-9-]+)["\']', html)
+                    if match_key:
+                        self._api_key = match_key.group(1)
+                    rating, count = self._parse_page_metadata(html)
+                    self._ratings_updated_at[source.external_id] = time.time()
+                    if rating is not None and 1.0 <= rating <= 5.0:
+                        self._branch_ratings[source.external_id] = rating
+                    if count is not None:
+                        self._branch_counts[source.external_id] = count
+                    return rating, count
+        except Exception as exc:
+            logger.debug("Failed to fetch 2GIS page metadata for %s: %s", source.branch_name, exc)
+        return self._branch_ratings.get(source.external_id), self._branch_counts.get(source.external_id)
 
     async def _rotate_key_from_page(self, firm_url: str) -> bool:
         session = await self._get_session()
@@ -60,8 +149,15 @@ class DGisReviewsClient:
                 if match:
                     self._api_key = match.group(1)
                     logger.info("Successfully rotated 2GIS reviewApiKey from page")
-                    return True
-                return False
+                rating, count = self._parse_page_metadata(html)
+                for ext_id in list(self._branch_ratings.keys()):
+                    if ext_id in firm_url:
+                        if rating is not None:
+                            self._branch_ratings[ext_id] = rating
+                        if count is not None:
+                            self._branch_counts[ext_id] = count
+                        self._ratings_updated_at[ext_id] = time.time()
+                return match is not None
         except Exception as exc:
             logger.warning("Failed to rotate 2GIS key from page: %s", exc)
             return False
@@ -100,6 +196,8 @@ class DGisReviewsClient:
                             http_status,
                         )
                         rotated = await self._rotate_key_from_page(source.url)
+                        cached_rating = self._branch_ratings.get(source.external_id)
+                        cached_count = self._branch_counts.get(source.external_id)
                         if rotated:
                             continue
                         return (
@@ -107,9 +205,12 @@ class DGisReviewsClient:
                             [],
                             f"2GIS API key rejected (HTTP {http_status}) and rotation failed",
                             http_status,
-                            None,
-                            None,
+                            cached_rating,
+                            cached_count,
                         )
+
+                    cached_rating = self._branch_ratings.get(source.external_id)
+                    cached_count = self._branch_counts.get(source.external_id)
 
                     if http_status == 429:
                         return (
@@ -117,8 +218,8 @@ class DGisReviewsClient:
                             [],
                             "Rate limited by 2GIS (HTTP 429)",
                             429,
-                            None,
-                            None,
+                            cached_rating,
+                            cached_count,
                         )
                     if http_status == 403:
                         return (
@@ -126,8 +227,8 @@ class DGisReviewsClient:
                             [],
                             "Access forbidden by 2GIS (HTTP 403)",
                             403,
-                            None,
-                            None,
+                            cached_rating,
+                            cached_count,
                         )
                     if http_status != 200:
                         return (
@@ -135,8 +236,8 @@ class DGisReviewsClient:
                             [],
                             f"HTTP {http_status}",
                             http_status,
-                            None,
-                            None,
+                            cached_rating,
+                            cached_count,
                         )
 
                     data = await resp.json()
@@ -146,8 +247,8 @@ class DGisReviewsClient:
                             [],
                             "Invalid response schema: expected reviews list",
                             200,
-                            None,
-                            None,
+                            cached_rating,
+                            cached_count,
                         )
                     reviews_data = data["reviews"]
                     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
@@ -168,6 +269,19 @@ class DGisReviewsClient:
                                 total_count = c_v
                         except (ValueError, TypeError):
                             pass
+
+                    # Ensure we have fresh rating and count directly from the 2GIS firm page
+                    now_ts = time.time()
+                    if (now_ts - self._ratings_updated_at.get(source.external_id, 0.0)) > 600.0:
+                        await self._fetch_branch_metadata(source)
+
+                    final_rating = self._branch_ratings.get(source.external_id)
+                    if final_rating is None:
+                        final_rating = branch_rating
+
+                    final_count = self._branch_counts.get(source.external_id)
+                    if final_count is None:
+                        final_count = total_count
 
                     items: list[ReviewItem] = []
                     for r in reviews_data:
@@ -272,8 +386,8 @@ class DGisReviewsClient:
                         items,
                         None,
                         200,
-                        branch_rating,
-                        total_count,
+                        final_rating,
+                        final_count,
                     )
 
             except aiohttp.ClientError as exc:
