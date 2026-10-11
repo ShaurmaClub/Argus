@@ -1,21 +1,29 @@
 import contextlib
+import json
 import logging
+import tempfile
+from datetime import datetime
 from html import escape
+from pathlib import Path
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.analytics.dashboard import DashboardService
+from app.analytics.telegram_monitoring import generate_monitoring_charts
 from app.bot.access import AccessRequestService
 from app.bot.keyboards import (
     alerts_keyboard,
+    alert_feedback_keyboard,
     confirm_keyboard,
     dashboards_keyboard,
     main_menu_keyboard,
     modules_keyboard,
+    monitoring_alerts_keyboard,
+    monitoring_stats_keyboard,
     reviews_menu_keyboard,
     reviews_sources_keyboard,
     settings_keyboard,
@@ -42,13 +50,17 @@ from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramS
 from app.config import Settings
 from app.modules import ModuleRegistry, ModuleStatus
 from app.reviews.models import ReviewsSyncAlreadyRunningError
+from app.services.daily_digest import DailyDigestService
+from app.services.llm.ollama_client import OllamaClient
 from app.storage.models import Source
 from app.storage.repositories import (
     RuntimeSettingsRepository,
     SourceRepository,
     TelegramKeywordRepository,
+    TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
+from app.time import local_date_iso, period_utc_bounds
 from app.vk.service import VKService
 
 logger = logging.getLogger(__name__)
@@ -219,6 +231,255 @@ async def tg_status_callback(query: CallbackQuery, module_registry: ModuleRegist
     await _edit(query, text, telegram_menu_keyboard(info.is_available))
 
 
+@router.callback_query(F.data == "tgm:llm")
+async def monitoring_llm_callback(
+    query: CallbackQuery,
+    settings: Settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+    ollama_client: OllamaClient | None,
+) -> None:
+    queued = await telegram_monitoring_repo.pending_count()
+    ready = settings.ollama_enabled and bool(settings.ollama_model)
+    latency = ollama_client.average_latency_ms if ollama_client else None
+    runtime = (
+        f"\nСредняя latency: <b>{latency} ms</b>" if latency is not None else ""
+    )
+
+
+@router.callback_query(F.data.startswith("tgm:stats:"))
+async def monitoring_stats_callback(
+    query: CallbackQuery,
+    settings: Settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+    source_repo: SourceRepository,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        days = int(parts[2])
+        source_id = None if parts[3] == "all" else int(parts[3])
+    except (IndexError, ValueError):
+        await query.answer("Некорректный период", show_alert=True)
+        return
+    if days not in {1, 7, 30}:
+        await query.answer("Некорректный период", show_alert=True)
+        return
+    start_iso, end_iso = period_utc_bounds(settings.timezone, days)
+    stats = await telegram_monitoring_repo.monitoring_summary(start_iso, end_iso, source_id)
+    period_name = "сегодня" if days == 1 else f"{days} дней"
+    lines = [
+        f"🔭 <b>Telegram Analytics — {period_name}</b>",
+        "",
+        f"Собрано сообщений: <b>{stats['collected']}</b>",
+        f"Проанализировано: <b>{stats['analyzed']}</b>",
+        f"Очередь: <b>{stats['pending']}</b> · отложено: <b>{stats['deferred']}</b>",
+        f"Ошибки анализа: <b>{stats['errors']}</b>",
+        "",
+        "<b>Настроение:</b>",
+        f"🟢 positive: {stats['positive']}",
+        f"⚪ neutral: {stats['neutral']}",
+        f"🔴 negative: {stats['negative']}",
+        "",
+        "<b>Риски:</b>",
+        f"🟡 severity 1: {stats['severity_1']}",
+        f"🟠 severity 2: {stats['severity_2']}",
+        f"🔴 severity 3: {stats['severity_3']}",
+    ]
+    if stats["topics"]:
+        lines.extend(["", "<b>Темы:</b>"])
+        lines.extend(
+            f"• {escape(item['label'])}: {item['count']}" for item in stats["topics"]
+        )
+    if stats["sources"]:
+        lines.extend(["", "<b>По источникам:</b>"])
+        lines.extend(
+            f"• {escape(item['label'])}: {item['count']}" for item in stats["sources"]
+        )
+    if stats["recent"]:
+        lines.extend(["", "<b>Последние сообщения:</b>"])
+        for item in stats["recent"]:
+            severity = item["severity"] if item["severity"] is not None else "—"
+            lines.append(
+                f"• {escape(item['source_title'])} · S{severity} · "
+                f"{escape((item['text'] or '[без текста]')[:140])}"
+            )
+    else:
+        lines.extend(["", "Новых сообщений за выбранный период пока нет."])
+
+    source_rows = []
+    for source in await source_repo.list_sources():
+        source_rows.append([
+            InlineKeyboardButton(
+                text=f"📡 {source.display_name[:28]}",
+                callback_data=f"tgm:stats:{days}:{source.id}",
+            )
+        ])
+    base_rows = monitoring_stats_keyboard(days).inline_keyboard
+    await _edit(
+        query,
+        "\n".join(lines),
+        InlineKeyboardMarkup(inline_keyboard=source_rows + base_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("tgm:backfill:"))
+async def monitoring_backfill_callback(
+    query: CallbackQuery,
+    collector: TelegramCollector | None,
+    source_repo: SourceRepository,
+) -> None:
+    if collector is None:
+        await query.answer("Telethon collector недоступен", show_alert=True)
+        return
+    try:
+        limit = max(1, min(int((query.data or "").rsplit(":", 1)[-1]), 200))
+    except ValueError:
+        await query.answer("Некорректный лимит", show_alert=True)
+        return
+    await query.answer("Загружаю историю для анализа…")
+    fetched = saved = failed = 0
+    for source in await source_repo.list_sources():
+        try:
+            result = await collector.backfill_analysis(source, limit)
+            fetched += result.fetched_count
+            saved += result.saved_count
+        except Exception:
+            logger.exception("Analysis backfill failed source_id=%s", source.id)
+            failed += 1
+    await _edit(
+        query,
+        "⏪ <b>История загружена</b>\n\n"
+        f"Получено: <b>{fetched}</b>\n"
+        f"Добавлено в анализ: <b>{saved}</b>\n"
+        f"Ошибок источников: <b>{failed}</b>\n\n"
+        "Исторические сообщения попадут в статистику, но не создадут старые алерты.",
+        monitoring_stats_keyboard(1),
+    )
+    if ollama_client and ollama_client.last_error:
+        runtime += f"\nПоследняя ошибка: {escape(ollama_client.last_error[:200])}"
+    await _edit(
+        query,
+        "🧠 <b>Ollama</b>\n\n"
+        f"Статус: {'✅ настроена' if ready else '⚠️ не настроена'}\n"
+        f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
+        f"Очередь анализа: <b>{queued}</b>{runtime}",
+        telegram_menu_keyboard(True),
+    )
+
+
+@router.callback_query(F.data == "tgm:digest")
+async def monitoring_digest_callback(
+    query: CallbackQuery,
+    digest_service: DailyDigestService,
+    settings: Settings,
+) -> None:
+    today = local_date_iso(settings.timezone)
+    await _edit(query, await digest_service.build(today), telegram_menu_keyboard(True))
+
+
+@router.callback_query(F.data.startswith("tgm:alerts:"))
+async def monitoring_alerts_callback(
+    query: CallbackQuery,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        days = int(parts[2])
+        severity = None if parts[3] == "all" else int(parts[3])
+    except (IndexError, ValueError):
+        await query.answer("Некорректный фильтр", show_alert=True)
+        return
+    alerts = await telegram_monitoring_repo.list_risk_alerts(
+        days=days, severity=severity, limit=10
+    )
+    lines = [f"🚨 <b>Требуют внимания — {days} дн.</b>"]
+    rows = []
+    for alert in alerts:
+        status = "✅" if alert["status"] == "reviewed" else "🆕"
+        lines.append(
+            f"\n{status} <b>#{alert['alert_id']} · severity {alert['severity']}</b>\n"
+            f"{escape(alert['source_title'])}: {escape((alert['text'] or '')[:180])}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                text=f"Открыть #{alert['alert_id']}",
+                callback_data=f"tgm:alert:{alert['alert_id']}",
+            )
+        ])
+    if not alerts:
+        lines.append("\nЗа выбранный период алертов нет.")
+    base = monitoring_alerts_keyboard(days, severity).inline_keyboard
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows + base))
+
+
+@router.callback_query(F.data.startswith("tgm:alert:"))
+async def monitoring_alert_detail_callback(
+    query: CallbackQuery,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    try:
+        alert_id = int((query.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await query.answer("Некорректный алерт", show_alert=True)
+        return
+    matches = [
+        item for item in await telegram_monitoring_repo.list_risk_alerts(days=3650, limit=100)
+        if item["alert_id"] == alert_id
+    ]
+    if not matches:
+        await query.answer("Алерт не найден", show_alert=True)
+        return
+    item = matches[0]
+    categories = ", ".join(json.loads(item["categories_json"]))
+    link = f'\n<a href="{escape(item["message_url"])}">🔗 Открыть сообщение</a>' if item["message_url"] else ""
+    await _edit(
+        query,
+        f"🚨 <b>Алерт #{item['alert_id']}</b>\n\n"
+        f"Источник: {escape(item['source_title'])}\n"
+        f"Уровень: <b>{item['severity']} / 3</b>\n"
+        f"Категории: {escape(categories)}\n"
+        f"Confidence: {item['confidence']:.0%}\n\n"
+        f"«{escape((item['text'] or '')[:1500])}»\n\n"
+        f"Почему: {escape(item['reason'])}{link}",
+        alert_feedback_keyboard(alert_id),
+    )
+
+
+@router.callback_query(F.data.startswith("tgm:feedback:"))
+async def monitoring_feedback_callback(
+    query: CallbackQuery,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        alert_id = int(parts[2])
+        verdict = parts[3]
+        admin_id = query.from_user.id
+        updated = await telegram_monitoring_repo.set_alert_feedback(alert_id, verdict, admin_id)
+    except (IndexError, ValueError):
+        await query.answer("Некорректная оценка", show_alert=True)
+        return
+    await query.answer("Оценка сохранена" if updated else "Алерт не найден", show_alert=True)
+
+
+@router.callback_query(F.data == "tgm:charts")
+async def monitoring_charts_callback(
+    query: CallbackQuery,
+    source_repo: SourceRepository,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+    settings: Settings,
+) -> None:
+    today = local_date_iso(settings.timezone)
+    for source in await source_repo.list_sources():
+        await telegram_monitoring_repo.aggregate_day(today, source.id)
+    rows = await telegram_monitoring_repo.chart_rows(30)
+    await query.answer()
+    if query.message is None:
+        return
+    with tempfile.TemporaryDirectory(prefix="argus-charts-") as directory:
+        for path in generate_monitoring_charts(rows, Path(directory)):
+            await query.message.answer_photo(FSInputFile(path))
+
+
 @router.callback_query(F.data == "tg:sources")
 async def tg_sources_callback(
     query: CallbackQuery,
@@ -229,7 +490,7 @@ async def tg_sources_callback(
     if not info.is_available:
         await _edit(query, unavailable_text(info), telegram_menu_keyboard(False))
         return
-    sources = await source_repo.list_sources()
+    sources = await source_repo.list_sources(include_inactive=True)
     if not sources:
         await _edit(
             query,
@@ -238,13 +499,57 @@ async def tg_sources_callback(
         )
         return
     lines = ["<b>Telegram sources</b>"]
+    rows = []
     for source in sources:
         telegram_id = source.telegram_reference_id or "unknown"
+        state = "🟢" if source.is_active else "⚪"
         lines.append(
-            f"#{source.id} {escape(source.display_name)}\n"
+            f"{state} #{source.id} {escape(source.display_name)}\n"
             f"  telegram_id: {telegram_id}, mode: {escape(source.telegram_monitor_mode)}"
         )
-    await _edit(query, "\n".join(lines), telegram_menu_keyboard(True))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=("🔕 Выключить" if source.is_active else "🔔 Включить") + f" #{source.id}",
+                    callback_data=f"tgm:source:toggle:{source.id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"🗑 Убрать #{source.id}",
+                    callback_data=f"tgm:source:remove:{source.id}",
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Telegram", callback_data="tg:menu")])
+    await _edit(query, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("tgm:source:"))
+async def monitoring_source_action_callback(
+    query: CallbackQuery,
+    source_repo: SourceRepository,
+    module_registry: ModuleRegistry,
+) -> None:
+    parts = (query.data or "").split(":")
+    try:
+        action, source_id = parts[2], int(parts[3])
+    except (IndexError, ValueError):
+        await query.answer("Некорректный источник", show_alert=True)
+        return
+    source = await source_repo.get_source(source_id)
+    if source is None:
+        await query.answer("Источник не найден", show_alert=True)
+        return
+    if action == "toggle":
+        active = not source.is_active
+        await source_repo.set_active(source_id, active)
+        await query.answer("Мониторинг включён" if active else "Мониторинг выключен")
+    elif action == "remove":
+        await source_repo.set_active(source_id, False)
+        await query.answer("Источник убран из мониторинга; история сохранена")
+    else:
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
+    await tg_sources_callback(query, module_registry, source_repo)
 
 
 @router.callback_query(F.data == "tg:add_source")
@@ -261,7 +566,7 @@ async def tg_add_source_callback(
     await state.set_state(TelegramSourceSetupStates.waiting_forward)
     await _edit(
         query,
-        "Перешли сюда сообщение из канала или discussion-группы. "
+        "Перешли сообщение из канала/группы или отправь ссылку t.me. "
         "После этого выберем режим мониторинга.",
         setup_cancel_keyboard(),
     )

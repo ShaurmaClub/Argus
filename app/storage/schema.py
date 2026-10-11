@@ -78,6 +78,69 @@ CREATE TABLE IF NOT EXISTS telegram_group_messages (
 CREATE INDEX IF NOT EXISTS idx_tg_group_messages_source_date
 ON telegram_group_messages(source_id, date);
 
+CREATE TABLE IF NOT EXISTS telegram_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    telegram_message_id INTEGER NOT NULL,
+    reply_to_message_id INTEGER,
+    text TEXT,
+    message_date TEXT NOT NULL,
+    message_url TEXT,
+    prefilter_priority INTEGER NOT NULL DEFAULT 0,
+    collected_at TEXT NOT NULL,
+    analyzed_at TEXT,
+    analysis_status TEXT NOT NULL DEFAULT 'pending',
+    analysis_attempts INTEGER NOT NULL DEFAULT 0,
+    last_analysis_error TEXT,
+    next_analysis_at TEXT,
+    alert_eligible INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(source_id, telegram_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tg_messages_pending
+ON telegram_messages(analysis_status, prefilter_priority DESC, collected_at);
+CREATE INDEX IF NOT EXISTS idx_tg_messages_source_date
+ON telegram_messages(source_id, message_date);
+
+CREATE TABLE IF NOT EXISTS telegram_message_analysis (
+    message_id INTEGER PRIMARY KEY REFERENCES telegram_messages(id) ON DELETE CASCADE,
+    risk INTEGER NOT NULL,
+    severity INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    categories_json TEXT NOT NULL,
+    sentiment TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    intent_level TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    analyzed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telegram_risk_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL UNIQUE REFERENCES telegram_messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'new',
+    reviewed_by INTEGER,
+    reviewed_at TEXT,
+    verdict TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telegram_daily_stats (
+    date TEXT NOT NULL,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    messages_count INTEGER NOT NULL DEFAULT 0,
+    positive_count INTEGER NOT NULL DEFAULT 0,
+    neutral_count INTEGER NOT NULL DEFAULT 0,
+    negative_count INTEGER NOT NULL DEFAULT 0,
+    severity_1_count INTEGER NOT NULL DEFAULT 0,
+    severity_2_count INTEGER NOT NULL DEFAULT 0,
+    severity_3_count INTEGER NOT NULL DEFAULT 0,
+    topics_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(date, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS telegram_keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     keyword TEXT NOT NULL UNIQUE,
@@ -277,6 +340,7 @@ async def init_schema(database: Database) -> None:
     await _ensure_alert_columns(database)
     await _ensure_review_columns(database)
     await _ensure_ai_analysis_table(database)
+    await _ensure_telegram_monitoring_columns(database)
     await connection.commit()
 
 
@@ -376,6 +440,18 @@ async def _ensure_review_columns(database: Database) -> None:
             )
         for stmt in sources_migrations:
             await connection.execute(stmt)
+
+
+async def _ensure_telegram_monitoring_columns(database: Database) -> None:
+    connection = database.require_connection()
+    async with connection.execute("PRAGMA table_info(telegram_messages)") as cursor:
+        columns = {row["name"] for row in await cursor.fetchall()}
+    if columns and "next_analysis_at" not in columns:
+        await connection.execute("ALTER TABLE telegram_messages ADD COLUMN next_analysis_at TEXT")
+    if columns and "alert_eligible" not in columns:
+        await connection.execute(
+            "ALTER TABLE telegram_messages ADD COLUMN alert_eligible INTEGER NOT NULL DEFAULT 1"
+        )
 
     # Verify reviews columns
     async with connection.execute("PRAGMA table_info(reviews)") as cursor:

@@ -1,4 +1,5 @@
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 
 try:
     from datetime import UTC
@@ -789,6 +790,322 @@ def mask_secret(value: str | None) -> str:
     if len(value) <= 8:
         return f"{value[:1]}***{value[-1:]}"
     return f"{value[:5]}******{value[-3:]}"
+
+
+class TelegramMonitoringRepository:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    async def save_message(
+        self, *, source_id: int, telegram_message_id: int, reply_to_message_id: int | None,
+        text: str | None, message_date: str, message_url: str | None,
+        prefilter_priority: int, analysis_status: str = "pending", alert_eligible: bool = True,
+    ) -> tuple[int, bool]:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        cursor = await connection.execute(
+            """
+            INSERT OR IGNORE INTO telegram_messages (
+                source_id, telegram_message_id, reply_to_message_id, text, message_date,
+                message_url, prefilter_priority, collected_at, analysis_status, alert_eligible
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (source_id, telegram_message_id, reply_to_message_id, text, message_date,
+             message_url, prefilter_priority, now, analysis_status, int(alert_eligible)),
+        )
+        created = cursor.rowcount == 1
+        async with connection.execute(
+            "SELECT id FROM telegram_messages WHERE source_id = ? AND telegram_message_id = ?",
+            (source_id, telegram_message_id),
+        ) as result:
+            row = await result.fetchone()
+        await connection.commit()
+        return int(row["id"]), created
+
+    async def pending(self, limit: int) -> list[dict]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """SELECT m.*, s.title AS source_title, s.username AS source_username,
+               reply.text AS reply_text
+               FROM telegram_messages m JOIN sources s ON s.id = m.source_id
+               LEFT JOIN telegram_messages reply
+                 ON reply.source_id=m.source_id
+                AND reply.telegram_message_id=m.reply_to_message_id
+               WHERE m.analysis_status IN ('pending', 'error')
+                 AND (m.next_analysis_at IS NULL OR m.next_analysis_at <= ?)
+               ORDER BY m.prefilter_priority DESC, m.collected_at ASC LIMIT ?""",
+            (utc_now_iso(), limit),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def pending_count(self) -> int:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            "SELECT COUNT(*) AS count FROM telegram_messages WHERE analysis_status IN ('pending','error')"
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["count"])
+
+    async def promote_deferred(self, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            """UPDATE telegram_messages SET analysis_status='pending'
+               WHERE id IN (
+                 SELECT id FROM telegram_messages WHERE analysis_status='deferred'
+                 ORDER BY prefilter_priority DESC, collected_at ASC LIMIT ?
+               )""",
+            (limit,),
+        )
+        await connection.commit()
+        return cursor.rowcount
+
+    async def health_stats(self) -> dict[str, int]:
+        connection = self.database.require_connection()
+        query = """SELECT
+            (SELECT COUNT(*) FROM sources WHERE kind='telegram') AS sources,
+            (SELECT COUNT(*) FROM sources WHERE kind='telegram' AND is_active=1) AS online,
+            (SELECT COUNT(*) FROM telegram_messages
+             WHERE substr(message_date,1,10)=date('now')) AS messages_today,
+            (SELECT COUNT(*) FROM telegram_risk_alerts
+             WHERE substr(created_at,1,10)=date('now')) AS alerts_today,
+            (SELECT COUNT(*) FROM telegram_messages
+             WHERE analysis_status IN ('pending','error')) AS queue"""
+        async with connection.execute(query) as cursor:
+            row = await cursor.fetchone()
+        return {key: int(row[key] or 0) for key in row.keys()}
+
+    async def save_analysis(self, message_id: int, result, model: str, prompt_version: str) -> bool:
+        connection = self.database.require_connection()
+        now = utc_now_iso()
+        cursor = await connection.execute(
+            """INSERT OR IGNORE INTO telegram_message_analysis (
+                message_id, risk, severity, confidence, categories_json, sentiment,
+                topic, intent_level, reason, model, prompt_version, analyzed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (message_id, int(result.risk), result.severity, result.confidence,
+             json.dumps(result.categories, ensure_ascii=False), result.sentiment, result.topic,
+             result.intent_level, result.reason, model, prompt_version, now),
+        )
+        await connection.execute(
+            """UPDATE telegram_messages SET analyzed_at=?, analysis_status='done',
+               last_analysis_error=NULL, next_analysis_at=NULL WHERE id=?""",
+            (now, message_id),
+        )
+        await connection.commit()
+        return cursor.rowcount == 1
+
+    async def set_active(self, source_id: int, active: bool) -> bool:
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            "UPDATE sources SET is_active = ?, updated_at = ? WHERE id = ?",
+            (int(active), utc_now_iso(), source_id),
+        )
+        await connection.commit()
+        return cursor.rowcount == 1
+
+    async def mark_error(self, message_id: int, error: str) -> None:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            "SELECT analysis_attempts FROM telegram_messages WHERE id=?", (message_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        attempts = int(row["analysis_attempts"] if row else 0) + 1
+        delay_seconds = min(900, 2 ** min(attempts, 9))
+        next_at = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+        await connection.execute(
+            """UPDATE telegram_messages SET analysis_status='error',
+               analysis_attempts=analysis_attempts+1, last_analysis_error=?,
+               next_analysis_at=? WHERE id=?""",
+            (error[:500], next_at, message_id),
+        )
+        await connection.commit()
+
+    async def create_risk_alert(self, message_id: int) -> int | None:
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            "INSERT OR IGNORE INTO telegram_risk_alerts(message_id, created_at) VALUES (?, ?)",
+            (message_id, utc_now_iso()),
+        )
+        await connection.commit()
+        if cursor.rowcount != 1:
+            return None
+        return int(cursor.lastrowid)
+
+    async def aggregate_day(self, date: str, source_id: int) -> dict:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """SELECT COUNT(*) AS messages_count,
+               SUM(CASE WHEN a.sentiment='positive' THEN 1 ELSE 0 END) AS positive_count,
+               SUM(CASE WHEN a.sentiment='neutral' THEN 1 ELSE 0 END) AS neutral_count,
+               SUM(CASE WHEN a.sentiment='negative' THEN 1 ELSE 0 END) AS negative_count,
+               SUM(CASE WHEN a.severity=1 THEN 1 ELSE 0 END) AS severity_1_count,
+               SUM(CASE WHEN a.severity=2 THEN 1 ELSE 0 END) AS severity_2_count,
+               SUM(CASE WHEN a.severity=3 THEN 1 ELSE 0 END) AS severity_3_count
+               FROM telegram_messages m
+               LEFT JOIN telegram_message_analysis a ON a.message_id=m.id
+               WHERE m.source_id=? AND substr(m.message_date,1,10)=?""",
+            (source_id, date),
+        ) as cursor:
+            counts = dict(await cursor.fetchone())
+        async with connection.execute(
+            """SELECT a.topic, COUNT(*) AS count FROM telegram_message_analysis a
+               JOIN telegram_messages m ON m.id=a.message_id
+               WHERE m.source_id=? AND substr(m.message_date,1,10)=?
+               GROUP BY a.topic ORDER BY count DESC""",
+            (source_id, date),
+        ) as cursor:
+            topics = {row["topic"]: row["count"] for row in await cursor.fetchall()}
+        result = {key: int(value or 0) for key, value in counts.items()}
+        result["topics"] = topics
+        await connection.execute(
+            """INSERT INTO telegram_daily_stats (
+               date, source_id, messages_count, positive_count, neutral_count, negative_count,
+               severity_1_count, severity_2_count, severity_3_count, topics_json, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date, source_id) DO UPDATE SET
+               messages_count=excluded.messages_count, positive_count=excluded.positive_count,
+               neutral_count=excluded.neutral_count, negative_count=excluded.negative_count,
+               severity_1_count=excluded.severity_1_count,
+               severity_2_count=excluded.severity_2_count,
+               severity_3_count=excluded.severity_3_count,
+               topics_json=excluded.topics_json, updated_at=excluded.updated_at""",
+            (date, source_id, result["messages_count"], result["positive_count"],
+             result["neutral_count"], result["negative_count"], result["severity_1_count"],
+             result["severity_2_count"], result["severity_3_count"],
+             json.dumps(topics, ensure_ascii=False), utc_now_iso()),
+        )
+        await connection.commit()
+        return result
+
+    async def chart_rows(self, days: int = 30) -> list[dict]:
+        connection = self.database.require_connection()
+        async with connection.execute(
+            """SELECT d.*, s.title FROM telegram_daily_stats d
+               JOIN sources s ON s.id=d.source_id
+               WHERE d.date >= date('now', ?) ORDER BY d.date, s.title""",
+            (f"-{max(1, days)} days",),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def list_risk_alerts(
+        self, *, days: int = 7, severity: int | None = None, limit: int = 20
+    ) -> list[dict]:
+        connection = self.database.require_connection()
+        conditions = ["r.created_at >= datetime('now', ?)"]
+        params: list[object] = [f"-{max(1, days)} days"]
+        if severity is not None:
+            conditions.append("a.severity = ?")
+            params.append(severity)
+        params.append(limit)
+        async with connection.execute(
+            f"""SELECT r.id AS alert_id, r.status, r.verdict, r.created_at,
+                m.text, m.message_url, m.telegram_message_id,
+                s.title AS source_title, a.severity, a.confidence,
+                a.categories_json, a.reason
+                FROM telegram_risk_alerts r
+                JOIN telegram_messages m ON m.id=r.message_id
+                JOIN telegram_message_analysis a ON a.message_id=m.id
+                JOIN sources s ON s.id=m.source_id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY r.created_at DESC LIMIT ?""",
+            tuple(params),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def set_alert_feedback(self, alert_id: int, verdict: str, admin_id: int) -> bool:
+        if verdict not in {"confirmed", "false_positive", "reviewed"}:
+            raise ValueError("Unknown alert verdict")
+        connection = self.database.require_connection()
+        cursor = await connection.execute(
+            """UPDATE telegram_risk_alerts SET status='reviewed', verdict=?,
+               reviewed_by=?, reviewed_at=? WHERE id=?""",
+            (verdict, admin_id, utc_now_iso(), alert_id),
+        )
+        await connection.commit()
+        return cursor.rowcount == 1
+
+    async def digest_rows(self, date: str, source_id: int | None = None) -> list[dict]:
+        connection = self.database.require_connection()
+        params: list[object] = [date]
+        source_filter = ""
+        if source_id is not None:
+            source_filter = " AND m.source_id=?"
+            params.append(source_id)
+        async with connection.execute(
+            f"""SELECT m.text, m.message_date, m.source_id, s.title AS source_title,
+                a.risk, a.severity, a.confidence, a.sentiment, a.topic, a.reason
+                FROM telegram_messages m
+                JOIN sources s ON s.id=m.source_id
+                LEFT JOIN telegram_message_analysis a ON a.message_id=m.id
+                WHERE substr(m.message_date,1,10)=? {source_filter}
+                ORDER BY a.severity DESC, a.confidence DESC, m.message_date DESC""",
+            tuple(params),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def monitoring_summary(
+        self, start_iso: str, end_iso: str, source_id: int | None = None
+    ) -> dict:
+        connection = self.database.require_connection()
+        source_condition = ""
+        params: list[object] = [start_iso, end_iso]
+        if source_id is not None:
+            source_condition = " AND m.source_id=?"
+            params.append(source_id)
+        async with connection.execute(
+            f"""SELECT COUNT(*) AS collected,
+                SUM(CASE WHEN a.message_id IS NOT NULL THEN 1 ELSE 0 END) AS analyzed,
+                SUM(CASE WHEN m.analysis_status='pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN m.analysis_status='deferred' THEN 1 ELSE 0 END) AS deferred,
+                SUM(CASE WHEN m.analysis_status='error' THEN 1 ELSE 0 END) AS errors,
+                SUM(CASE WHEN a.sentiment='positive' THEN 1 ELSE 0 END) AS positive,
+                SUM(CASE WHEN a.sentiment='neutral' THEN 1 ELSE 0 END) AS neutral,
+                SUM(CASE WHEN a.sentiment='negative' THEN 1 ELSE 0 END) AS negative,
+                SUM(CASE WHEN a.severity=1 THEN 1 ELSE 0 END) AS severity_1,
+                SUM(CASE WHEN a.severity=2 THEN 1 ELSE 0 END) AS severity_2,
+                SUM(CASE WHEN a.severity=3 THEN 1 ELSE 0 END) AS severity_3
+                FROM telegram_messages m
+                LEFT JOIN telegram_message_analysis a ON a.message_id=m.id
+                WHERE m.message_date>=? AND m.message_date<=? {source_condition}""",
+            tuple(params),
+        ) as cursor:
+            row = await cursor.fetchone()
+        result = {key: int(row[key] or 0) for key in row.keys()}
+
+        async def grouped(column: str, limit: int = 10) -> list[dict]:
+            grouped_params: list[object] = [start_iso, end_iso]
+            if source_id is not None:
+                grouped_params.append(source_id)
+            async with connection.execute(
+                f"""SELECT {column} AS label, COUNT(*) AS count
+                    FROM telegram_messages m
+                    LEFT JOIN telegram_message_analysis a ON a.message_id=m.id
+                    JOIN sources s ON s.id=m.source_id
+                    WHERE m.message_date>=? AND m.message_date<=? {source_condition}
+                      AND {column} IS NOT NULL
+                    GROUP BY {column} ORDER BY count DESC LIMIT ?""",
+                (*grouped_params, limit),
+            ) as cursor:
+                return [dict(item) for item in await cursor.fetchall()]
+
+        result["topics"] = await grouped("a.topic", 5)
+        result["sources"] = await grouped("s.title", 20)
+        recent_params: list[object] = [start_iso, end_iso]
+        if source_id is not None:
+            recent_params.append(source_id)
+        async with connection.execute(
+            f"""SELECT m.text, m.message_date, m.analysis_status, s.title AS source_title,
+                a.severity, a.sentiment, a.topic
+                FROM telegram_messages m JOIN sources s ON s.id=m.source_id
+                LEFT JOIN telegram_message_analysis a ON a.message_id=m.id
+                WHERE m.message_date>=? AND m.message_date<=? {source_condition}
+                ORDER BY m.message_date DESC LIMIT 5""",
+            tuple(recent_params),
+        ) as cursor:
+            result["recent"] = [dict(item) for item in await cursor.fetchall()]
+        return result
 
 
 class VkRepository:
@@ -1670,6 +1987,7 @@ class RepositoryBundle:
         self.posts = PostRepository(database)
         self.comments = CommentRepository(database)
         self.group_messages = TelegramGroupMessageRepository(database)
+        self.telegram_monitoring = TelegramMonitoringRepository(database)
         self.keywords = TelegramKeywordRepository(database)
         self.snapshots = StatsSnapshotRepository(database)
         self.alerts = AlertRepository(database)

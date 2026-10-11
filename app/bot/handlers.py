@@ -1,13 +1,17 @@
 from html import escape
+import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from app.analytics.dashboard import DashboardService
 from app.analytics.periods import parse_period
+from app.analytics.telegram_monitoring import generate_monitoring_charts
 from app.bot.keyboards import (
     main_menu_keyboard,
     reviews_menu_keyboard,
@@ -30,6 +34,7 @@ from app.bot.states import TelegramSourceSetupStates
 from app.collectors.telegram import LargeFloodWait, TelegramCollector, TelegramSourceError
 from app.modules import ModuleRegistry, ModuleStatus
 from app.reviews.models import ReviewsSyncAlreadyRunningError
+from app.services.daily_digest import DailyDigestService
 from app.storage.models import Post, Source, TelegramGroupMessage
 from app.storage.repositories import (
     PostRepository,
@@ -37,8 +42,10 @@ from app.storage.repositories import (
     SourceRepository,
     TelegramGroupMessageRepository,
     TelegramKeywordRepository,
+    TelegramMonitoringRepository,
 )
 from app.telegram_auth import TelegramAuthService
+from app.time import local_date_iso, period_utc_bounds
 from app.vk.service import VKService
 
 router = Router(name="admin")
@@ -80,6 +87,13 @@ Telegram Monitor:
 /tg_dashboard &lt;source_id_or_telegram_id&gt; &lt;period&gt;
 /tg_sync_posts &lt;source_id&gt;
 /tg_set_mode &lt;source_id&gt; &lt;posts|discussion&gt;
+/tg_monitor
+/tg_alerts
+/tg_digest
+/tg_charts
+/tg_llm_status
+/tg_stats [1|7|30]
+/tg_backfill [limit]
 
 Legacy Telegram commands still work when Telegram Monitor is available:
 /sources
@@ -112,6 +126,125 @@ async def request_access_command(message: Message) -> None:
 @router.message(Command("status"))
 async def status_command(message: Message, module_registry: ModuleRegistry) -> None:
     await message.answer(await status_text(module_registry))
+
+
+@router.message(Command("tg_monitor"))
+async def tg_monitor_command(
+    message: Message,
+    module_registry: ModuleRegistry,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    info = await module_registry.telegram_info()
+    queued = await telegram_monitoring_repo.pending_count()
+    await message.answer(
+        "🔭 <b>Telegram Monitoring</b>\n\n"
+        f"Collector: <b>{escape(info.status.value)}</b>\n"
+        f"Очередь анализа: <b>{queued}</b>\n\n"
+        "Команды: /tg_sources, /tg_alerts, /tg_digest, /tg_charts, /tg_llm_status"
+    )
+
+
+@router.message(Command("tg_llm_status"))
+async def tg_llm_status_command(
+    message: Message,
+    settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    queued = await telegram_monitoring_repo.pending_count()
+    configured = bool(settings.ollama_enabled and settings.ollama_model)
+    await message.answer(
+        "🧠 <b>Ollama</b>\n"
+        f"Статус конфигурации: {'✅ готово' if configured else '⚠️ не настроено'}\n"
+        f"Модель: <code>{escape(settings.ollama_model or 'не задана')}</code>\n"
+        f"Очередь: <b>{queued}</b>"
+    )
+
+
+@router.message(Command("tg_stats"))
+async def tg_stats_command(
+    message: Message,
+    command: CommandObject,
+    settings,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+) -> None:
+    try:
+        days = int(_single_argument(command) or "1")
+    except ValueError:
+        days = 1
+    if days not in {1, 7, 30}:
+        await message.answer("Использование: /tg_stats [1|7|30]")
+        return
+    start_iso, end_iso = period_utc_bounds(settings.timezone, days)
+    stats = await telegram_monitoring_repo.monitoring_summary(start_iso, end_iso)
+    await message.answer(
+        f"🔭 <b>Telegram Analytics — {days} дн.</b>\n\n"
+        f"Собрано: <b>{stats['collected']}</b>\n"
+        f"Проанализировано: <b>{stats['analyzed']}</b>\n"
+        f"Очередь: <b>{stats['pending']}</b> · отложено: {stats['deferred']}\n"
+        f"Ошибки: <b>{stats['errors']}</b>\n\n"
+        f"Настроение: 🟢 {stats['positive']} · ⚪ {stats['neutral']} · 🔴 {stats['negative']}\n"
+        f"Риски: S1 {stats['severity_1']} · S2 {stats['severity_2']} · S3 {stats['severity_3']}"
+    )
+
+
+@router.message(Command("tg_backfill"))
+async def tg_backfill_command(
+    message: Message,
+    command: CommandObject,
+    collector: TelegramCollector | None,
+    source_repo: SourceRepository,
+) -> None:
+    if collector is None:
+        await message.answer("Telethon collector недоступен.")
+        return
+    try:
+        limit = max(1, min(int(_single_argument(command) or "50"), 200))
+    except ValueError:
+        await message.answer("Использование: /tg_backfill [1..200]")
+        return
+    fetched = saved = failed = 0
+    for source in await source_repo.list_sources():
+        try:
+            result = await collector.backfill_analysis(source, limit)
+            fetched += result.fetched_count
+            saved += result.saved_count
+        except Exception:
+            failed += 1
+    await message.answer(
+        f"История: получено {fetched}, добавлено в анализ {saved}, ошибок {failed}. "
+        "Старые алерты отправляться не будут."
+    )
+
+
+@router.message(Command("tg_alerts"))
+async def tg_alerts_command(message: Message) -> None:
+    await message.answer(
+        "🚨 Риск-алерты отправляются автоматически при достижении настроенного порога. "
+        "Фильтр и журнал доступны в таблице telegram_risk_alerts."
+    )
+
+
+@router.message(Command("tg_digest"))
+async def tg_digest_command(message: Message, digest_service: DailyDigestService, settings) -> None:
+    today = local_date_iso(settings.timezone)
+    await message.answer(await digest_service.build(today))
+
+
+@router.message(Command("tg_charts"))
+async def tg_charts_command(
+    message: Message,
+    source_repo: SourceRepository,
+    telegram_monitoring_repo: TelegramMonitoringRepository,
+    settings,
+) -> None:
+    today = local_date_iso(settings.timezone)
+    for source in await source_repo.list_sources():
+        await telegram_monitoring_repo.aggregate_day(today, source.id)
+    rows = await telegram_monitoring_repo.chart_rows(30)
+    with tempfile.TemporaryDirectory(prefix="argus-charts-") as directory:
+        paths = generate_monitoring_charts(rows, Path(directory))
+        for path in paths:
+            await message.answer_photo(FSInputFile(path))
 
 
 @router.message(Command("modules"))
@@ -272,7 +405,7 @@ async def tg_add_source_command(
     await state.clear()
     await state.set_state(TelegramSourceSetupStates.waiting_forward)
     await message.answer(
-        "Перешли сюда сообщение из канала или discussion-группы. "
+        "Перешли сообщение из канала/группы или отправь ссылку t.me. "
         "После этого выберем режим мониторинга.",
         reply_markup=setup_cancel_keyboard(),
     )
