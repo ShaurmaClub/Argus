@@ -65,7 +65,7 @@ class DGisReviewsClient:
 
         # Fallback for rating: og:description ("Оценка 4.8...") or HTML tags
         if rating is None:
-            m_og = re.search(r'Оценка\s+([0-9.]+)', html)
+            m_og = re.search(r"Оценка\s+([0-9.]+)", html)
             if m_og:
                 try:
                     r_val = round(float(m_og.group(1)), 1)
@@ -95,7 +95,7 @@ class DGisReviewsClient:
                     pass
 
         if count is None:
-            m_cnt_txt = re.search(r'([0-9]+)\s+(?:оценок|отзыв)', html)
+            m_cnt_txt = re.search(r"([0-9]+)\s+(?:оценок|отзыв)", html)
             if m_cnt_txt:
                 try:
                     c_val = int(m_cnt_txt.group(1))
@@ -107,7 +107,7 @@ class DGisReviewsClient:
         return rating, count
 
     async def _fetch_branch_metadata(
-        self, source: ReviewSource
+        self, source: ReviewSource, api_rating: float | None = None
     ) -> tuple[float | None, int | None]:
         session = await self._get_session()
         try:
@@ -119,19 +119,99 @@ class DGisReviewsClient:
             async with session.get(source.url, headers=headers) as resp:
                 if resp.status == 200:
                     html = await resp.text(errors="replace")
-                    match_key = re.search(r'["\']reviewApiKey["\']\s*:\s*["\']([a-f0-9-]+)["\']', html)
+                    match_key = re.search(
+                        r'["\']reviewApiKey["\']\s*:\s*["\']([a-f0-9-]+)["\']', html
+                    )
                     if match_key:
                         self._api_key = match_key.group(1)
                     rating, count = self._parse_page_metadata(html)
+
+                    # Determine reference/expected rating
+                    curr_rating = self._branch_ratings.get(source.external_id)
+                    if curr_rating is None and source.last_rating is not None:
+                        try:
+                            curr_val = round(float(source.last_rating), 1)
+                            if 1.0 <= curr_val <= 5.0:
+                                curr_rating = curr_val
+                        except (ValueError, TypeError):
+                            pass
+
+                    effective_rating = rating
+                    effective_count = count
+
+                    # Anti-flapping & CDN edge cache jitter protection:
+                    # If page rating differs from current known rating or api_rating,
+                    # verify with a second confirmation fetch to rule out a stale CDN edge node.
+                    reference_rating = curr_rating if curr_rating is not None else api_rating
+                    if (
+                        rating is not None
+                        and 1.0 <= rating <= 5.0
+                        and reference_rating is not None
+                        and rating != reference_rating
+                    ):
+                        try:
+                            async with session.get(source.url, headers=headers) as resp2:
+                                if resp2.status == 200:
+                                    html2 = await resp2.text(errors="replace")
+                                    rating2, count2 = self._parse_page_metadata(html2)
+                                    if rating2 is not None and rating2 != rating:
+                                        # Edge nodes returned conflicting ratings (e.g. 4.9 vs 5.0).
+                                        # Prioritize authoritative backend api_rating
+                                        # or confirmed reference.
+                                        logger.warning(
+                                            "2GIS CDN edge cache inconsistency detected for %s: "
+                                            "fetch1=%s, fetch2=%s; retaining confirmed rating %s",
+                                            source.branch_name,
+                                            rating,
+                                            rating2,
+                                            reference_rating,
+                                        )
+                                        if api_rating is not None and api_rating in (
+                                            rating,
+                                            rating2,
+                                        ):
+                                            effective_rating = api_rating
+                                        else:
+                                            effective_rating = reference_rating
+                                    elif rating2 == rating:
+                                        # Both independent fetches agree on the new rating.
+                                        effective_rating = rating
+                                    if count2 is not None and count is not None:
+                                        effective_count = max(count, count2)
+                        except Exception as conf_exc:
+                            logger.debug(
+                                "Failed confirmation fetch for %s: %s", source.branch_name, conf_exc
+                            )
+
+                    # If the API rating and current rating both agree (e.g. 5.0),
+                    # never let a single inconsistent page fetch downgrade it.
+                    if (
+                        api_rating is not None
+                        and curr_rating is not None
+                        and api_rating == curr_rating
+                        and effective_rating != api_rating
+                    ):
+                        logger.info(
+                            "2GIS page rating %s disagrees with API & current rating %s for %s, "
+                            "retaining %s",
+                            effective_rating,
+                            api_rating,
+                            source.branch_name,
+                            api_rating,
+                        )
+                        effective_rating = api_rating
+
                     self._ratings_updated_at[source.external_id] = time.time()
-                    if rating is not None and 1.0 <= rating <= 5.0:
-                        self._branch_ratings[source.external_id] = rating
-                    if count is not None:
-                        self._branch_counts[source.external_id] = count
-                    return rating, count
+                    if effective_rating is not None and 1.0 <= effective_rating <= 5.0:
+                        self._branch_ratings[source.external_id] = effective_rating
+                    if effective_count is not None:
+                        self._branch_counts[source.external_id] = effective_count
+                    return effective_rating, effective_count
         except Exception as exc:
             logger.debug("Failed to fetch 2GIS page metadata for %s: %s", source.branch_name, exc)
-        return self._branch_ratings.get(source.external_id), self._branch_counts.get(source.external_id)
+        return self._branch_ratings.get(source.external_id), self._branch_counts.get(
+            source.external_id
+        )
 
     async def _rotate_key_from_page(self, firm_url: str) -> bool:
         session = await self._get_session()
@@ -273,7 +353,7 @@ class DGisReviewsClient:
                     # Ensure we have fresh rating and count directly from the 2GIS firm page
                     now_ts = time.time()
                     if (now_ts - self._ratings_updated_at.get(source.external_id, 0.0)) > 600.0:
-                        await self._fetch_branch_metadata(source)
+                        await self._fetch_branch_metadata(source, api_rating=branch_rating)
 
                     final_rating = self._branch_ratings.get(source.external_id)
                     if final_rating is None:

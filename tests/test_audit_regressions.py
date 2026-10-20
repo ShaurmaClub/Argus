@@ -4,6 +4,13 @@ import json
 import time
 import urllib.error
 from dataclasses import replace
+from datetime import datetime
+
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = UTC
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -273,3 +280,113 @@ async def test_2gis_prefers_page_rating_over_microservice_meta():
     assert rating == 4.8
     assert count == 69
 
+
+@pytest.mark.asyncio
+async def test_2gis_cdn_cache_inconsistency_rejected():
+    """
+    When 2GIS CDN edge caches flap between stale and fresh (e.g. 4.9 on one node vs 5.0 on another),
+    and API returns authoritative 5.0, the stale 4.9 must be discarded and 5.0 retained.
+    """
+    from app.reviews.client_2gis import DGisReviewsClient
+
+    client = DGisReviewsClient()
+    source = ReviewSource(
+        id=12,
+        platform=ReviewPlatform.DGIS,
+        branch_name="УО Моссовет",
+        external_id="4504127908875284",
+        url="https://2gis.ru/moscow/firm/4504127908875284/tab/reviews",
+        last_rating=5.0,
+    )
+    client._branch_ratings[source.external_id] = 5.0
+    client._branch_counts[source.external_id] = 76
+
+    # API returns 5.0
+    api_resp = AsyncMock()
+    api_resp.status = 200
+    api_resp.json = AsyncMock(
+        return_value={
+            "reviews": [],
+            "meta": {"branch_rating": 5.0, "total_count": 68},
+        }
+    )
+
+    # Page fetch 1 returns stale 4.9 (from a stale CDN edge node)
+    page_resp_1 = AsyncMock()
+    page_resp_1.status = 200
+    page_resp_1.text = AsyncMock(
+        return_value='{"reviews":{"general_rating":4.9,"general_review_count_with_stars":76}}'
+    )
+
+    # Confirmation page fetch 2 returns fresh 5.0
+    page_resp_2 = AsyncMock()
+    page_resp_2.status = 200
+    page_resp_2.text = AsyncMock(
+        return_value='{"reviews":{"general_rating":5.0,"general_review_count_with_stars":76}}'
+    )
+
+    mock_session = MagicMock()
+    mock_session.closed = False
+
+    # Simulate get calls:
+    # 1. API call
+    # 2. Page fetch 1
+    # 3. Confirmation page fetch 2
+    mock_session.get.side_effect = [
+        AsyncMock(__aenter__=AsyncMock(return_value=api_resp)),
+        AsyncMock(__aenter__=AsyncMock(return_value=page_resp_1)),
+        AsyncMock(__aenter__=AsyncMock(return_value=page_resp_2)),
+    ]
+    client._session = mock_session
+
+    status, items, err, code, rating, count = await client.fetch_reviews(source)
+    assert status == ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS
+    # Stale 4.9 must NOT override 5.0!
+    assert rating == 5.0
+    assert count == 76
+
+
+@pytest.mark.asyncio
+async def test_service_anti_flapping_rating_alert(test_env):
+    """
+    Verify that if a rating oscillates rapidly (e.g. 5.0 -> 4.9 -> 5.0 within 1h),
+    the reverse flapping alert is suppressed so users are not spammed.
+    """
+    service = test_env["service"]
+    bundle = test_env["bundle"]
+    bot = test_env["bot"]
+
+    await bundle.reviews.ensure_default_sources(DEFAULT_SOURCES)
+    source = await bundle.reviews.get_source_by_external_id("yandex", "1093602317")
+
+    await bundle.reviews.mark_source_initialized(source.id)
+    await bundle.reviews.update_source_status(
+        source.id,
+        status="SUCCESS_NO_NEW_REVIEWS",
+        checked_at=datetime.now(UTC).isoformat(),
+        success=True,
+        last_rating=5.0,
+        total_reviews_count=290,
+    )
+    s_curr = await bundle.reviews.get_source_by_id(source.id)
+
+    # 1. First rating change: 5.0 -> 4.9 (Genuine alert should be sent)
+    test_env["yandex_client"].fetch_reviews = AsyncMock(
+        return_value=(ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 4.9, 290)
+    )
+    bot.sent_messages.clear()
+    await service.sync_source(s_curr)
+    assert len(bot.sent_messages) == 1
+    assert "5.0 ➔ <b>4.9</b>" in bot.sent_messages[0]["text"]
+
+    # 2. Flapping back within minutes: 4.9 -> 5.0 (Flapping alert must be suppressed!)
+    s_curr = await bundle.reviews.get_source_by_id(source.id)
+    assert s_curr.last_rating == 4.9
+
+    test_env["yandex_client"].fetch_reviews = AsyncMock(
+        return_value=(ReviewSyncStatus.SUCCESS_NO_NEW_REVIEWS, [], None, 200, 5.0, 290)
+    )
+    bot.sent_messages.clear()
+    await service.sync_source(s_curr)
+    # The flapping alert is suppressed!
+    assert len(bot.sent_messages) == 0

@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 try:
     from datetime import UTC
 except ImportError:
     from datetime import timezone
+
     UTC = timezone.utc  # noqa: UP017
 
 from app.alerts.service import AlertService
@@ -51,6 +53,7 @@ class ReviewsService:
         self._default_sources_seeded = False
         self._ai_worker = ai_worker
         self._ai_worker_started = False
+        self._last_rating_alerts: dict[int, tuple[float, float, float]] = {}
 
     def get_ai_worker(self) -> GeminiReviewWorker:
         if self._ai_worker is None:
@@ -140,9 +143,7 @@ class ReviewsService:
         latency_ms = int((asyncio.get_event_loop().time() - t_start) * 1000)
         consecutive = source.consecutive_errors + 1
         backoff_sec = min(300 * (2 ** (consecutive - 1)), config.max_backoff_seconds)
-        backoff_iso = datetime.fromtimestamp(
-            now_dt.timestamp() + backoff_sec, tz=UTC
-        ).isoformat()
+        backoff_iso = datetime.fromtimestamp(now_dt.timestamp() + backoff_sec, tz=UTC).isoformat()
 
         health_alert_active = source.health_alert_active
         health_alert_sent_at = source.health_alert_sent_at
@@ -166,8 +167,7 @@ class ReviewsService:
                     health_alert_sent_at = now_iso
                 else:
                     logger.warning(
-                        "Review health alert delivery failed, "
-                        "preserving state to retry next cycle"
+                        "Review health alert delivery failed, preserving state to retry next cycle"
                     )
             except Exception as alert_exc:
                 logger.error("Failed to send review health alert: %s", alert_exc)
@@ -245,9 +245,7 @@ class ReviewsService:
         # Call platform client
         if source.platform == ReviewPlatform.YANDEX:
             client = self._get_yandex_client()
-            res = await client.fetch_reviews(
-                source, page=1, page_size=config.fetch_page_size
-            )
+            res = await client.fetch_reviews(source, page=1, page_size=config.fetch_page_size)
             status, items, err, http_code = res[:4]
             branch_rating = res[4] if len(res) >= 5 else None
             total_count = res[5] if len(res) >= 6 else None
@@ -516,9 +514,7 @@ class ReviewsService:
                     rev_id = str(it.external_review_id)
                     if rev_id in seen_ids:
                         continue
-                    is_known = await self.repository.is_review_known(
-                        it.platform, rev_id
-                    )
+                    is_known = await self.repository.is_review_known(it.platform, rev_id)
                     if is_known:
                         continue
 
@@ -540,7 +536,7 @@ class ReviewsService:
                         historical_items.append(it)
                         seen_ids.add(rev_id)
                         hit_historical_horizon = True
-                        for rest_it in c_items[idx + 1:]:
+                        for rest_it in c_items[idx + 1 :]:
                             rest_id = str(rest_it.external_review_id)
                             if rest_id not in seen_ids:
                                 historical_items.append(rest_it)
@@ -571,11 +567,16 @@ class ReviewsService:
 
         if catchup_incomplete:
             return await self._handle_sync_failure(
-                source, ReviewSyncStatus.UNKNOWN_ERROR,
+                source,
+                ReviewSyncStatus.UNKNOWN_ERROR,
                 "Catch-up limit reached before the known review boundary; "
                 "increase REVIEWS_MAX_CATCHUP_REVIEWS and retry. "
                 "No new reviews were marked as known.",
-                http_code, now_dt, now_iso, t_start, config,
+                http_code,
+                now_dt,
+                now_iso,
+                t_start,
+                config,
             )
 
         # Silently persist any unindexed historical reviews (mark_sent=True)
@@ -627,27 +628,50 @@ class ReviewsService:
             and config.alerts_enabled
             and self.alerts
         ):
-            try:
-                logger.info(
-                    "Rating changed for %s (%s): %s -> %s",
-                    source.branch_name,
-                    source.platform,
-                    old_rating_val,
-                    branch_rating,
-                )
-                effective_cnt = (
-                    total_count
-                    if total_count is not None
-                    else source.total_reviews_count
-                )
-                await self.alerts.send_rating_change_alert(
-                    source=source,
-                    old_rating=old_rating_val,
-                    new_rating=branch_rating,
-                    total_count=effective_cnt,
-                )
-            except Exception as rating_exc:
-                logger.error("Failed to send rating change alert: %s", rating_exc)
+            now_ts = time.time()
+            last_alert = getattr(self, "_last_rating_alerts", {}).get(source.id)
+            is_flapping = False
+            if last_alert is not None:
+                alert_ts, prev_old, prev_new = last_alert
+                if (
+                    prev_new == old_rating_val
+                    and prev_old == branch_rating
+                    and (now_ts - alert_ts) < 3600.0
+                ):
+                    is_flapping = True
+                    logger.warning(
+                        "Suppressing flapping rating alert for %s (%s): %s -> %s "
+                        "(reverted within %.0fs)",
+                        source.branch_name,
+                        source.platform,
+                        old_rating_val,
+                        branch_rating,
+                        now_ts - alert_ts,
+                    )
+
+            if not is_flapping:
+                try:
+                    logger.info(
+                        "Rating changed for %s (%s): %s -> %s",
+                        source.branch_name,
+                        source.platform,
+                        old_rating_val,
+                        branch_rating,
+                    )
+                    effective_cnt = (
+                        total_count if total_count is not None else source.total_reviews_count
+                    )
+                    await self.alerts.send_rating_change_alert(
+                        source=source,
+                        old_rating=old_rating_val,
+                        new_rating=branch_rating,
+                        total_count=effective_cnt,
+                    )
+                    if not hasattr(self, "_last_rating_alerts"):
+                        self._last_rating_alerts = {}
+                    self._last_rating_alerts[source.id] = (now_ts, old_rating_val, branch_rating)
+                except Exception as rating_exc:
+                    logger.error("Failed to send rating change alert: %s", rating_exc)
 
         # Do not overwrite valid last_rating with None if branch_rating failed to fetch
         effective_rating = (
